@@ -20,6 +20,14 @@ UNIT_RE = re.compile(r"^[A-Za-z0-9:_.\\@-]{1,200}\.service$")
 CLASS_RE = re.compile(r"^[^\x00-\x1f\x7f/]{1,128}$")
 # Interpreters, shells and launchers: ignoring one of these would protect
 # every script on the machine, not the app the user picked.
+# The desktop session itself. earlyoom's stock --avoid covers only init,
+# systemd, Xorg and sshd, so once the apps a user protected are skipped its
+# next pick is often the Omarchy shell (quickshell) or the compositor:
+# measured in the VM, it killed the shell 11 times in two minutes until the
+# shell's supervisor gave up and the bar was gone. Omarchy keeps these out of
+# systemd-oomd's reach by putting them in session.slice; the earlyoom link
+# does the same.
+SESSION_COMMS = ("Hyprland", "quickshell", "Xwayland")
 GENERIC_COMMS = frozenset("""
 bash sh zsh fish dash env sleep cat python python3 node nodejs deno bun java perl ruby
 systemd systemd-run uwsm-app xdg-terminal-ex gtk-launch setsid sudo su timeout nohup
@@ -94,11 +102,10 @@ def earlyoom_names(rules):
 
 
 def earlyoom_regex(rules):
-    """The value earlyoom gets after --ignore, or "" for none.
+    """The value earlyoom gets after --ignore: the desktop session plus the
+    user's protected names.
 
     Anchored on the whole comm. "." and "+" go in brackets so the regex needs
     no backslash (systemd unescapes those in EnvironmentFile values)."""
-    names = earlyoom_names(rules)
-    if not names:
-        return ""
+    names = sorted(set(earlyoom_names(rules)) | set(SESSION_COMMS))
     return "^(" + "|".join(n.replace(".", "[.]").replace("+", "[+]") for n in names) + ")$"

@@ -63,7 +63,7 @@ def test_regex_is_anchored_and_needs_no_backslashes():
     rules = [{"kind": "app", "key": "a", "comms": ["chromium", "obsidian"]},
              {"kind": "service", "key": "x.service", "comms": ["my.app+x"]}]
     rx = R.earlyoom_regex(rules)
-    assert rx == "^(chromium|my[.]app[+]x|obsidian)$"
+    assert rx == "^(Hyprland|Xwayland|chromium|my[.]app[+]x|obsidian|quickshell)$"
     assert "\\" not in rx and " " not in rx
     pat = re.compile(rx)
     assert pat.search("chromium") and not pat.search("chromium-x") and not pat.search("xchromium")
@@ -73,7 +73,8 @@ def test_regex_is_anchored_and_needs_no_backslashes():
 @pytest.mark.parametrize("bad", ["python3", "bash", "a b", "x;rm", "$(id)", "a\\b", "", "a" * 16, "ev\u202egnp"])
 def test_unsafe_or_generic_names_never_reach_earlyoom(bad):
     rules = R.parse_rules(json.dumps({"protected": [{"kind": "app", "key": "k", "comms": [bad]}]}))
-    assert R.earlyoom_regex(rules) == ""
+    assert R.earlyoom_names(rules) == []
+    assert R.earlyoom_regex(rules) == R.earlyoom_regex([])
 
 
 def test_parse_rules_drops_garbage_and_duplicates():
@@ -102,7 +103,14 @@ def test_helper_env_line_round_trips_through_systemd_rules():
     # whitespace into exactly ["--ignore", regex].
     rules = [{"kind": "app", "key": "a", "comms": ["chromium", "Obsidian"]}]
     value = "--ignore " + R.earlyoom_regex(rules)
-    assert value.split() == ["--ignore", "^(Obsidian|chromium)$"]
+    assert value.split() == ["--ignore", "^(Hyprland|Obsidian|Xwayland|chromium|quickshell)$"]
+
+
+def test_the_desktop_session_is_always_shielded_from_earlyoom():
+    pat = re.compile(R.earlyoom_regex([]))
+    for name in ("Hyprland", "quickshell", "Xwayland"):
+        assert pat.search(name)
+    assert not pat.search("Hyprlandx") and not pat.search("chromium")
 
 
 # ---------------------------------------------------------------- bridge
@@ -212,7 +220,7 @@ def test_earlyoom_applied_reads_the_running_argv(env, monkeypatch):
     rules = [{"kind": "app", "key": "a", "comms": ["chromium"]}]
     d = env / "proc" / "77"
     d.mkdir(parents=True)
-    (d / "cmdline").write_bytes(b"/usr/bin/earlyoom\0-r\0003600\0--ignore\0^(chromium)$\0")
+    (d / "cmdline").write_bytes(b"/usr/bin/earlyoom\0-r\0003600\0--ignore\0" + R.earlyoom_regex(rules).encode() + b"\0")
     units = {"earlyoom.service": {"LoadState": "loaded", "ActiveState": "active", "MainPID": "77"},
              b.SYNC_PATH_UNIT: {"LoadState": "loaded", "ActiveState": "active"}}
     st = b.earlyoom_state(rules, units)

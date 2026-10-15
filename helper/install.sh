@@ -44,8 +44,8 @@ install -m 0644 "$src/helper/oomguard-earlyoom-sync.service" /etc/systemd/system
 chmod 0644 /etc/systemd/system/oomguard-earlyoom-sync.path
 install -m 0644 "$src/helper/earlyoom-dropin.conf" /etc/systemd/system/earlyoom.service.d/50-oomguard.conf
 
-/usr/lib/oomguard/oomguard-earlyoom-sync
 systemctl daemon-reload
+/usr/lib/oomguard/oomguard-earlyoom-sync
 systemctl enable --now oomguard-earlyoom-sync.path
 systemctl try-restart earlyoom.service
 printf '%s\n' 'OOM Guard is linked to earlyoom. Protected apps are now skipped by earlyoom too.'
