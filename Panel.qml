@@ -194,277 +194,284 @@ Panel {
         contentWidth: panel.fittedContentWidth(Style.space(420))
         contentHeight: panel.fittedContentHeight(layout.implicitHeight, Style.space(560))
 
-        PanelKeyCatcher {
-            id: keyCatcher
+        // The catcher is blocked while the dialog is open, so its keys bubble
+        // up to here. Handling them on the catcher itself would let the same
+        // Return that opens the dialog also answer it.
+        Item {
             anchors.fill: parent
-            blocked: confirmation.opened
-            onMoveRequested: function(dx, dy) {
-                if (dx !== 0) root.selectTab(Model.nextTab(root.tab, dx));
-                else root.moveCursor(dy);
-            }
-            onActivateRequested: if (root.cursorActive) root.activate(root.cursorRow)
-            onCloseRequested: root.close()
-            onTabRequested: function(direction) { root.selectTab(Model.nextTab(root.tab, direction)) }
-            onTextKey: function(t) { root.handleTextKey(t) }
             Keys.onPressed: function(event) {
                 if (confirmation.opened) { confirmation.handleKey(event); event.accepted = true; }
             }
 
-            Column {
-                id: layout
-                width: parent.width
-                spacing: Style.space(10)
-                enabled: !confirmation.opened
+            PanelKeyCatcher {
+                id: keyCatcher
+                anchors.fill: parent
+                blocked: confirmation.opened
+                onMoveRequested: function(dx, dy) {
+                    if (dx !== 0) root.selectTab(Model.nextTab(root.tab, dx));
+                    else root.moveCursor(dy);
+                }
+                onActivateRequested: if (root.cursorActive) root.activate(root.cursorRow)
+                onCloseRequested: root.close()
+                onTabRequested: function(direction) { root.selectTab(Model.nextTab(root.tab, direction)) }
+                onTextKey: function(t) { root.handleTextKey(t) }
 
-                PanelHero {
-                    id: hero
+                Column {
+                    id: layout
                     width: parent.width
-                    title: "OOM Guard"
-                    meta: Model.heroMeta(root.status, root.status ? "" : root.errorText)
-                    foreground: root.foreground
-                    fontFamily: root.fontFamily
-                    iconComponent: Component {
-                        Text {
-                            textFormat: Text.PlainText
-                            text: Model.barGlyph(root.status)
-                            color: root.killer.level === "warn" ? root.urgent : root.foreground
-                            font.family: root.fontFamily
-                            font.pixelSize: Style.font.display
+                    spacing: Style.space(10)
+                    enabled: !confirmation.opened
+
+                    PanelHero {
+                        id: hero
+                        width: parent.width
+                        title: "OOM Guard"
+                        meta: Model.heroMeta(root.status, root.status ? "" : root.errorText)
+                        foreground: root.foreground
+                        fontFamily: root.fontFamily
+                        iconComponent: Component {
+                            Text {
+                                textFormat: Text.PlainText
+                                text: Model.barGlyph(root.status)
+                                color: root.killer.level === "warn" ? root.urgent : root.foreground
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.display
+                            }
                         }
                     }
-                }
 
-                // Who can kill apps on this machine, in one line.
-                Row {
-                    width: parent.width
-                    spacing: Style.space(8)
-                    visible: root.killer.text !== ""
-                    Text {
-                        id: killerText
-                        width: parent.width - (linkButton.visible ? linkButton.width + parent.spacing : 0)
-                        anchors.verticalCenter: parent.verticalCenter
-                        textFormat: Text.PlainText
-                        wrapMode: Text.WordWrap
-                        text: root.killer.text
-                        color: root.killer.level === "warn" ? root.urgent : root.muted
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
+                    // Who can kill apps on this machine, in one line.
+                    Row {
+                        width: parent.width
+                        spacing: Style.space(8)
+                        visible: root.killer.text !== ""
+                        Text {
+                            id: killerText
+                            width: parent.width - (linkButton.visible ? linkButton.width + parent.spacing : 0)
+                            anchors.verticalCenter: parent.verticalCenter
+                            textFormat: Text.PlainText
+                            wrapMode: Text.WordWrap
+                            text: root.killer.text
+                            color: root.killer.level === "warn" ? root.urgent : root.muted
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption
+                        }
+                        Button {
+                            id: linkButton
+                            anchors.verticalCenter: parent.verticalCenter
+                            visible: root.killer.action === "link" && root.status && root.status.terminalAvailable
+                            text: "Link…"
+                            bordered: true
+                            foreground: root.foreground
+                            fontFamily: root.fontFamily
+                            fontSize: Style.font.bodySmall
+                            tooltipText: "L · opens a terminal that runs helper/install.sh with sudo"
+                            onClicked: root.linkEarlyoom()
+                        }
                     }
-                    Button {
-                        id: linkButton
-                        anchors.verticalCenter: parent.verticalCenter
-                        visible: root.killer.action === "link" && root.status && root.status.terminalAvailable
-                        text: "Link…"
-                        bordered: true
+
+                    ButtonGroup {
+                        id: tabs
+                        width: parent.width
+                        options: Model.TABS.map(function(t) { return {value: t, label: Model.TAB_LABELS[t]}; })
+                        value: root.tab
+                        focusable: false
                         foreground: root.foreground
                         fontFamily: root.fontFamily
                         fontSize: Style.font.bodySmall
-                        tooltipText: "L · opens a terminal that runs helper/install.sh with sudo"
-                        onClicked: root.linkEarlyoom()
-                    }
-                }
-
-                ButtonGroup {
-                    id: tabs
-                    width: parent.width
-                    options: Model.TABS.map(function(t) { return {value: t, label: Model.TAB_LABELS[t]}; })
-                    value: root.tab
-                    focusable: false
-                    foreground: root.foreground
-                    fontFamily: root.fontFamily
-                    fontSize: Style.font.bodySmall
-                    onChanged: function(v) { root.selectTab(v) }
-                }
-
-                Flickable {
-                    id: panelFlick
-                    width: parent.width
-                    height: Math.min(contentHeight, Style.space(380))
-                    contentWidth: width
-                    contentHeight: list.implicitHeight
-                    clip: true
-                    boundsBehavior: Flickable.StopAtBounds
-                    flickableDirection: Flickable.VerticalFlick
-                    interactive: contentHeight > height
-                    Controls.ScrollBar.vertical: Controls.ScrollBar { policy: Controls.ScrollBar.AsNeeded }
-                    WheelHandler {
-                        acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
-                        onWheel: function(event) {
-                            if (!panelFlick.interactive) return;
-                            panelFlick.cancelFlick();
-                            panelFlick.contentY = Model.wheelContentY(panelFlick.contentY, panelFlick.contentHeight, panelFlick.height,
-                                                                      event.pixelDelta.y, event.angleDelta.y, Style.spacing.popupRowHeight * 3);
-                            event.accepted = true;
-                        }
+                        onChanged: function(v) { root.selectTab(v) }
                     }
 
-                    Column {
-                        id: list
-                        width: panelFlick.width
-                        spacing: Style.space(4)
-
-                        Repeater {
-                            model: root.rows.length
-                            delegate: CursorSurface {
-                                id: rowItem
-                                required property int index
-                                readonly property var entry: root.rows[index] || ({})
-                                width: list.width
-                                implicitHeight: Style.space(44)
-                                hasCursor: root.cursorActive && root.cursor === index
-                                current: entry.protected === true && entry.kind !== "kill"
-                                foreground: root.foreground
-                                onHasCursorChanged: if (hasCursor) root.ensureVisible(rowItem)
-
-                                MouseArea {
-                                    anchors.fill: parent
-                                    hoverEnabled: true
-                                    onEntered: { root.cursorActive = true; root.cursor = rowItem.index }
-                                    onClicked: root.activate(rowItem.entry)
-                                }
-                                Text {
-                                    id: glyph
-                                    anchors.left: parent.left
-                                    anchors.leftMargin: Style.space(10)
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    width: Style.space(22)
-                                    textFormat: Text.PlainText
-                                    text: rowItem.entry.kind === "kill" ? (rowItem.entry.protected ? "󰕥" : "󰚌")
-                                          : (rowItem.entry.protected ? (rowItem.entry.state === "pending" ? "󰞀" : "󰕥") : "󰒙")
-                                    color: rowItem.entry.kind === "kill" ? (rowItem.entry.protected ? Commons.Color.accent : root.urgent)
-                                           : (rowItem.entry.protected ? Commons.Color.accent : root.muted)
-                                    font.family: root.fontFamily
-                                    font.pixelSize: Style.font.icon
-                                }
-                                Column {
-                                    anchors.left: glyph.right
-                                    anchors.right: trailing.left
-                                    anchors.rightMargin: Style.space(8)
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    spacing: Style.space(2)
-                                    Text {
-                                        width: parent.width
-                                        textFormat: Text.PlainText
-                                        elide: Text.ElideRight
-                                        text: rowItem.entry.name || ""
-                                        color: rowItem.entry.running === false ? root.muted : root.foreground
-                                        font.family: root.fontFamily
-                                        font.pixelSize: Style.font.body
-                                        font.bold: rowItem.entry.protected === true && rowItem.entry.kind !== "kill"
-                                    }
-                                    Text {
-                                        width: parent.width
-                                        textFormat: Text.PlainText
-                                        elide: Text.ElideRight
-                                        text: rowItem.entry.sub || ""
-                                        color: rowItem.entry.state === "pending" || rowItem.entry.state === "foreign" ? root.urgent : root.muted
-                                        font.family: root.fontFamily
-                                        font.pixelSize: Style.font.caption
-                                    }
-                                }
-                                Row {
-                                    id: trailing
-                                    anchors.right: parent.right
-                                    anchors.rightMargin: Style.space(10)
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    spacing: Style.space(10)
-                                    Text {
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        visible: rowItem.entry.kind !== "kill" && (rowItem.entry.memBytes || 0) > 0
-                                        textFormat: Text.PlainText
-                                        text: Model.formatBytes(rowItem.entry.memBytes)
-                                        color: root.muted
-                                        font.family: root.fontFamily
-                                        font.pixelSize: Style.font.caption
-                                    }
-                                    ToggleSwitch {
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        visible: rowItem.entry.kind !== "kill" || rowItem.entry.protectable || rowItem.entry.protected
-                                        checked: rowItem.entry.protected === true
-                                        busy: service.mutating
-                                        cursorRing: false
-                                        foreground: root.foreground
-                                        onToggled: root.activate(rowItem.entry)
-                                    }
-                                }
+                    Flickable {
+                        id: panelFlick
+                        width: parent.width
+                        height: Math.min(contentHeight, Style.space(380))
+                        contentWidth: width
+                        contentHeight: list.implicitHeight
+                        clip: true
+                        boundsBehavior: Flickable.StopAtBounds
+                        flickableDirection: Flickable.VerticalFlick
+                        interactive: contentHeight > height
+                        Controls.ScrollBar.vertical: Controls.ScrollBar { policy: Controls.ScrollBar.AsNeeded }
+                        WheelHandler {
+                            acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                            onWheel: function(event) {
+                                if (!panelFlick.interactive) return;
+                                panelFlick.cancelFlick();
+                                panelFlick.contentY = Model.wheelContentY(panelFlick.contentY, panelFlick.contentHeight, panelFlick.height,
+                                                                          event.pixelDelta.y, event.angleDelta.y, Style.spacing.popupRowHeight * 3);
+                                event.accepted = true;
                             }
                         }
 
                         Column {
-                            width: list.width
-                            visible: root.rows.length === 0
-                            topPadding: Style.space(28)
-                            bottomPadding: Style.space(28)
-                            spacing: Style.space(6)
-                            Text {
-                                anchors.horizontalCenter: parent.horizontalCenter
-                                textFormat: Text.PlainText
-                                text: root.tab === "kills" ? "󰄬" : "󰒙"
-                                color: root.muted
-                                font.family: root.fontFamily
-                                font.pixelSize: Style.space(30)
+                            id: list
+                            width: panelFlick.width
+                            spacing: Style.space(4)
+
+                            Repeater {
+                                model: root.rows.length
+                                delegate: CursorSurface {
+                                    id: rowItem
+                                    required property int index
+                                    readonly property var entry: root.rows[index] || ({})
+                                    width: list.width
+                                    implicitHeight: Style.space(44)
+                                    hasCursor: root.cursorActive && root.cursor === index
+                                    current: entry.protected === true && entry.kind !== "kill"
+                                    foreground: root.foreground
+                                    onHasCursorChanged: if (hasCursor) root.ensureVisible(rowItem)
+
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        onEntered: { root.cursorActive = true; root.cursor = rowItem.index }
+                                        onClicked: root.activate(rowItem.entry)
+                                    }
+                                    Text {
+                                        id: glyph
+                                        anchors.left: parent.left
+                                        anchors.leftMargin: Style.space(10)
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: Style.space(22)
+                                        textFormat: Text.PlainText
+                                        text: rowItem.entry.kind === "kill" ? (rowItem.entry.protected ? "󰕥" : "󰚌")
+                                              : (rowItem.entry.protected ? (rowItem.entry.state === "pending" ? "󰞀" : "󰕥") : "󰒙")
+                                        color: rowItem.entry.kind === "kill" ? (rowItem.entry.protected ? Commons.Color.accent : root.urgent)
+                                               : (rowItem.entry.protected ? Commons.Color.accent : root.muted)
+                                        font.family: root.fontFamily
+                                        font.pixelSize: Style.font.icon
+                                    }
+                                    Column {
+                                        anchors.left: glyph.right
+                                        anchors.right: trailing.left
+                                        anchors.rightMargin: Style.space(8)
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        spacing: Style.space(2)
+                                        Text {
+                                            width: parent.width
+                                            textFormat: Text.PlainText
+                                            elide: Text.ElideRight
+                                            text: rowItem.entry.name || ""
+                                            color: rowItem.entry.running === false ? root.muted : root.foreground
+                                            font.family: root.fontFamily
+                                            font.pixelSize: Style.font.body
+                                            font.bold: rowItem.entry.protected === true && rowItem.entry.kind !== "kill"
+                                        }
+                                        Text {
+                                            width: parent.width
+                                            textFormat: Text.PlainText
+                                            elide: Text.ElideRight
+                                            text: rowItem.entry.sub || ""
+                                            color: rowItem.entry.state === "pending" || rowItem.entry.state === "foreign" ? root.urgent : root.muted
+                                            font.family: root.fontFamily
+                                            font.pixelSize: Style.font.caption
+                                        }
+                                    }
+                                    Row {
+                                        id: trailing
+                                        anchors.right: parent.right
+                                        anchors.rightMargin: Style.space(10)
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        spacing: Style.space(10)
+                                        Text {
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            visible: rowItem.entry.kind !== "kill" && (rowItem.entry.memBytes || 0) > 0
+                                            textFormat: Text.PlainText
+                                            text: Model.formatBytes(rowItem.entry.memBytes)
+                                            color: root.muted
+                                            font.family: root.fontFamily
+                                            font.pixelSize: Style.font.caption
+                                        }
+                                        ToggleSwitch {
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            visible: rowItem.entry.kind !== "kill" || rowItem.entry.protectable || rowItem.entry.protected
+                                            checked: rowItem.entry.protected === true
+                                            busy: service.mutating
+                                            cursorRing: false
+                                            foreground: root.foreground
+                                            onToggled: root.activate(rowItem.entry)
+                                        }
+                                    }
+                                }
                             }
-                            Text {
-                                width: parent.width
-                                horizontalAlignment: Text.AlignHCenter
-                                wrapMode: Text.WordWrap
-                                textFormat: Text.PlainText
-                                text: !root.status ? "Reading…"
-                                      : root.tab === "kills" ? (service.killsLoaded ? "Nothing was killed for lack of memory in the last 30 days." : "Reading the journal…")
-                                      : root.tab === "apps" ? "No open windows." : "No user services in app.slice."
-                                color: root.muted
-                                font.family: root.fontFamily
-                                font.pixelSize: Style.font.body
+
+                            Column {
+                                width: list.width
+                                visible: root.rows.length === 0
+                                topPadding: Style.space(28)
+                                bottomPadding: Style.space(28)
+                                spacing: Style.space(6)
+                                Text {
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    textFormat: Text.PlainText
+                                    text: root.tab === "kills" ? "󰄬" : "󰒙"
+                                    color: root.muted
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.space(30)
+                                }
+                                Text {
+                                    width: parent.width
+                                    horizontalAlignment: Text.AlignHCenter
+                                    wrapMode: Text.WordWrap
+                                    textFormat: Text.PlainText
+                                    text: !root.status ? "Reading…"
+                                          : root.tab === "kills" ? (service.killsLoaded ? "Nothing was killed for lack of memory in the last 30 days." : "Reading the journal…")
+                                          : root.tab === "apps" ? "No open windows." : "No user services in app.slice."
+                                    color: root.muted
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.body
+                                }
                             }
+                        }
+                    }
+
+                    Item {
+                        id: footer
+                        width: parent.width
+                        height: Style.space(24)
+                        Text {
+                            anchors.left: parent.left
+                            anchors.right: hintsText.left
+                            anchors.rightMargin: Style.space(10)
+                            anchors.verticalCenter: parent.verticalCenter
+                            textFormat: Text.PlainText
+                            elide: Text.ElideRight
+                            text: root.errorText !== "" ? root.errorText : root.notice
+                            color: root.errorText !== "" ? root.urgent : root.muted
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption
+                        }
+                        Text {
+                            id: hintsText
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            textFormat: Text.PlainText
+                            text: Model.hints(root.tab, root.cursorRow)
+                            color: root.muted
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption
                         }
                     }
                 }
 
-                Item {
-                    id: footer
-                    width: parent.width
-                    height: Style.space(24)
-                    Text {
-                        anchors.left: parent.left
-                        anchors.right: hintsText.left
-                        anchors.rightMargin: Style.space(10)
-                        anchors.verticalCenter: parent.verticalCenter
-                        textFormat: Text.PlainText
-                        elide: Text.ElideRight
-                        text: root.errorText !== "" ? root.errorText : root.notice
-                        color: root.errorText !== "" ? root.urgent : root.muted
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                    }
-                    Text {
-                        id: hintsText
-                        anchors.right: parent.right
-                        anchors.verticalCenter: parent.verticalCenter
-                        textFormat: Text.PlainText
-                        text: Model.hints(root.tab, root.cursorRow)
-                        color: root.muted
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                    }
+                // Takes the hover so a row's tooltip never draws over the dialog.
+                MouseArea {
+                    anchors.fill: parent
+                    visible: confirmation.opened
+                    hoverEnabled: true
+                    acceptedButtons: Qt.NoButton
                 }
-            }
-
-            // Takes the hover so a row's tooltip never draws over the dialog.
-            MouseArea {
-                anchors.fill: parent
-                visible: confirmation.opened
-                hoverEnabled: true
-                acceptedButtons: Qt.NoButton
-            }
-            ConfirmDialog {
-                id: confirmation
-                anchors.fill: parent
-                z: 10
-                selectedIndex: 0
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                onCanceled: { opened = false; root.confirmKind = ""; root.confirmKey = ""; keyCatcher.forceActiveFocus() }
-                onConfirmed: { opened = false; root.confirmUnprotect(); keyCatcher.forceActiveFocus() }
+                ConfirmDialog {
+                    id: confirmation
+                    anchors.fill: parent
+                    z: 10
+                    selectedIndex: 0
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    onCanceled: { opened = false; root.confirmKind = ""; root.confirmKey = ""; keyCatcher.forceActiveFocus() }
+                    onConfirmed: { opened = false; root.confirmUnprotect(); keyCatcher.forceActiveFocus() }
+                }
             }
         }
     }
