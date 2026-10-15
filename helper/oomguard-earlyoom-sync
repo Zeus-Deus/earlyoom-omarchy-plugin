@@ -1,0 +1,86 @@
+#!/usr/bin/python3 -I
+"""Root side of OOM Guard: turn users' protected lists into earlyoom's --ignore.
+
+Started by oomguard-earlyoom-sync.path whenever a user's
+~/.config/oomguard/protected.json changes. It reads every human user's list
+(bounded, regular files only, never following symlinks), builds one anchored
+process-name regex with the same code the panel uses (rules.py), writes it to
+/etc/oomguard/earlyoom.env and, only when the value changed, restarts
+earlyoom so it takes effect. Names are limited to [A-Za-z0-9._+-]{1,15} and
+interpreters such as python or bash are refused, so nobody can ignore every
+script on the machine through this file.
+
+A user's list can only make earlyoom skip process names; it cannot stop
+earlyoom, change thresholds or add other options.
+"""
+import os
+import pwd
+import stat
+import subprocess
+import sys
+
+LIB = "/usr/lib/oomguard"
+sys.path.insert(0, LIB)
+import rules as R  # noqa: E402
+
+ENV_FILE = "/etc/oomguard/earlyoom.env"
+MAX_BYTES = 64 * 1024
+
+
+def read_list(home):
+    path = os.path.join(home, ".config", "oomguard", "protected.json")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return []
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_BYTES:
+            return []
+        data = os.read(fd, MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(data) > MAX_BYTES:
+        return []
+    return R.parse_rules(data.decode("utf-8", "replace"))
+
+
+def human_homes():
+    for pw in pwd.getpwall():
+        if 1000 <= pw.pw_uid < 60000 and pw.pw_dir.startswith("/home/"):
+            yield pw.pw_dir
+
+
+def main():
+    rules = []
+    for home in sorted(set(human_homes())):
+        rules.extend(read_list(home))
+    regex = R.earlyoom_regex(rules)
+    # Value goes after `--ignore` in ExecStart; an empty value means no list.
+    line = "OOMGUARD_ARGS=%s\n" % ("--ignore " + regex if regex else "")
+    for ch in regex:
+        if not (ch.isalnum() or ch in "^$()|[]._+-"):
+            print("refusing unexpected character in regex", file=sys.stderr)
+            return 1
+    try:
+        with open(ENV_FILE, encoding="utf-8") as f:
+            old = f.read()
+    except OSError:
+        old = None
+    if old == line:
+        return 0
+    os.makedirs(os.path.dirname(ENV_FILE), mode=0o755, exist_ok=True)
+    tmp = ENV_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(line)
+    os.replace(tmp, ENV_FILE)
+    names = ", ".join(R.earlyoom_names(rules)) or "none"
+    print("earlyoom protected process names: " + names)
+    # try-restart: only if earlyoom is running; never starts a stopped one.
+    subprocess.run(["systemctl", "try-restart", "earlyoom.service"], check=False, timeout=30)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

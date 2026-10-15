@@ -1,0 +1,14 @@
+[Unit]
+Description=Apply OOM Guard protected names to earlyoom
+StartLimitIntervalSec=60
+StartLimitBurst=20
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/oomguard/oomguard-earlyoom-sync
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/etc/oomguard
+PrivateTmp=true
+PrivateNetwork=true
+NoNewPrivileges=true

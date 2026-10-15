@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.zeus-deus.oomguard",
+  "name": "OOM Guard",
+  "version": "0.1.0",
+  "author": "Zeus-Deus",
+  "license": "MIT",
+  "description": "Protect the apps and services you care about from being killed when memory runs out. Works with Omarchy's systemd-oomd and with earlyoom.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {"barWidget": "Panel.qml"},
+  "barWidget": {
+    "displayName": "OOM Guard",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {"refreshIntervalSec": 3},
+    "schema": [
+      {"key": "refreshIntervalSec", "type": "integer", "label": "Refresh interval while the panel is open (seconds)", "min": 2, "max": 30, "step": 1, "defaultValue": 3}
+    ]
+  }
+}
