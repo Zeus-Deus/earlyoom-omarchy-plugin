@@ -180,7 +180,10 @@ function killerNotice(status) {
     if (oomd.active) parts.push("systemd-oomd");
     if (eo.active) parts.push("earlyoom");
     if (parts.length === 0) return {text: "No OOM daemon is running. Only the kernel can kill apps.", level: "ok", action: ""};
-    return {text: "Protected from " + parts.join(" and "), level: "ok", action: ""};
+    var who = parts.join(" and ");
+    if (protectedCount(status) === 0)
+        return {text: who + " can close any app when memory runs out. Switch on the ones to keep.", level: "ok", action: ""};
+    return {text: "Switched-on apps are skipped by " + who + ".", level: "ok", action: ""};
 }
 
 function barGlyph(status) {

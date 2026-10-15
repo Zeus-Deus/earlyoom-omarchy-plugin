@@ -124,6 +124,21 @@ def test_inventory_follows_a_browser_across_two_scopes(env, monkeypatch):
     assert a["comms"][0] == "chromium" and not a["guarded"]
 
 
+def test_session_slice_and_zombies_never_count_as_part_of_an_app(env, monkeypatch):
+    b = load_bridge()
+    own = add_cgroup(env, "app.slice/app-graphical.slice/app-Hyprland-nautilus-d990889f.scope", [15], mem=170 << 20)
+    hypr = add_cgroup(env, "session.slice/wayland-wm@hyprland.desktop.service", [2], mem=900 << 20)
+    add_proc(env, 15, 2, "nautilus", own)
+    add_proc(env, 16, 15, "uwsm-app", hypr)
+    (env / "proc" / "16" / "stat").write_text("16 (uwsm-app) Z 15 0 0\n")
+    add_proc(env, 17, 15, "Hyprland", hypr)  # even a live child there is not the app's
+    monkeypatch.setattr(b, "hypr_clients", lambda: [{"class": "org.gnome.Nautilus", "pid": 15}])
+    monkeypatch.setattr(b, "desktop_names", lambda: {})
+    a = b.app_inventory(MANAGER)[0]
+    assert a["scopes"] == [own] and a["memBytes"] == 170 << 20
+    assert "Hyprland" not in a["comms"]
+
+
 def test_protect_app_moves_every_scope_and_saves_the_list(env, monkeypatch):
     b = load_bridge()
     own = add_cgroup(env, "app.slice/app-org.chromium.Chromium-10.scope", [10])

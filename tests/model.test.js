@@ -68,7 +68,9 @@ test('killerNotice warns when earlyoom runs without the link, and offers Link', 
   const base = {oomd: {active: true}, earlyoom: {active: true, linked: false, names: ['chromium']}, rules: []};
   same(Model.killerNotice(base), {text: 'earlyoom is running and does not know this list yet.', level: 'warn', action: 'link'});
   base.earlyoom = {active: true, linked: true, applied: true, names: ['chromium']};
-  assert.equal(Model.killerNotice(base).text, 'Protected from systemd-oomd and earlyoom');
+  assert.match(Model.killerNotice(base).text, /can close any app/);
+  base.rules = [{kind: 'app', key: 'chromium'}];
+  assert.equal(Model.killerNotice(base).text, 'Switched-on apps are skipped by systemd-oomd and earlyoom.');
   same(Model.killerNotice({oomd: {active: true, guardWatched: true}, earlyoom: {}}).level, 'warn');
   assert.match(Model.killerNotice({oomd: {}, earlyoom: {}}).text, /No OOM daemon/);
 });

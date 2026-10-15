@@ -227,18 +227,34 @@ def process_children():
     return kids
 
 
+def app_owned(path, manager):
+    """Cgroups an app can own: app.slice (what oomd watches) and our guard.
+    Never session.slice: that is Hyprland and the portals."""
+    return path.startswith(manager + "/app.slice/") or path.startswith(manager + "/" + GUARD_SLICE + "/")
+
+
+def is_zombie(pid):
+    raw = read_sys(os.path.join(proc_root(), str(int(pid)), "stat"), 1024)
+    end = raw.rfind(")")
+    return end > 0 and raw[end + 2:end + 3] == "Z"
+
+
 def app_cgroups(pid, kids, manager, limit=4000):
-    """Cgroups of a window's process and every descendant. Chromium-family
+    """Cgroups of a window's process and every live descendant. Chromium-family
     browsers move their main process into a scope of their own while the
-    renderers stay in the launcher's scope, so one app can span two scopes."""
+    renderers stay in the launcher's scope, so one app can span two scopes.
+    Zombies are skipped: a reaped-late launcher child reports the cgroup of
+    whoever started it (Hyprland's service), which is not the app's."""
     seen, out, stack = set(), [], [pid]
     while stack and len(seen) < limit:
         p = stack.pop()
         if p in seen:
             continue
         seen.add(p)
+        if is_zombie(p):
+            continue
         cg = pid_cgroup(p)
-        if cg.startswith(manager + "/") and cg not in out:
+        if app_owned(cg, manager) and cg not in out:
             out.append(cg)
         stack.extend(kids.get(p, []))
     return out
@@ -587,9 +603,9 @@ def apply_rules(rules, manager, only=None):
     """Move every running window of a protected class out of app.slice."""
     moved, errors = [], []
     wanted = {r["key"] for r in rules if r["kind"] == "app" and (only is None or r["key"] == only)}
-    if not wanted:
-        return moved, errors, []
     apps = app_inventory(manager)
+    if not wanted:
+        return moved, errors, apps
     for row in apps:
         if row["key"] not in wanted:
             continue

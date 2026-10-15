@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls as Controls
 import Quickshell
+import Quickshell.Io
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
@@ -43,7 +44,7 @@ Panel {
         tab = name;
         cursor = 0;
         if (name === "kills") service.loadKills();
-        if (panelFlick) panelFlick.contentY = 0;
+        panelFlick.contentY = 0;
     }
     function moveCursor(dy) {
         if (!cursorActive) { cursorActive = true; cursor = Math.max(0, Math.min(cursor, rows.length - 1)); return; }
@@ -96,9 +97,8 @@ Panel {
         service.linkEarlyoom();
     }
 
-    readonly property Item panelFlick: panel.loadedContent ? panel.loadedContent.panelFlick : null
     function ensureVisible(item) {
-        if (!item || !panelFlick) return;
+        if (!item) return;
         var pt = item.mapToItem(panelFlick.contentItem, 0, 0);
         var margin = Style.space(8);
         if (pt.y < panelFlick.contentY + margin) panelFlick.contentY = Math.max(0, pt.y - margin);
@@ -112,7 +112,7 @@ Panel {
             errorText = "";
             service.refresh();
             if (tab === "kills") service.loadKills();
-            Qt.callLater(function() { if (panel.loadedContent) panel.loadedContent.forceActiveFocus() });
+            Qt.callLater(function() { keyCatcher.forceActiveFocus() });
         } else {
             confirmation.opened = false;
         }
@@ -146,7 +146,7 @@ Panel {
     }
     Timer { id: noticeTimer; interval: 3000; onTriggered: root.notice = "" }
 
-    ShellIpc {
+    IpcHandler {
         target: root.ipcTarget
         function open(): void { root.open() }
         function close(): void { root.close() }
@@ -188,14 +188,14 @@ Panel {
         owner: root
         bar: root.bar
         open: root.opened
-        focusTarget: panel.loadedContent
+        focusTarget: keyCatcher
+        // Eager children (not the newer lazy `content:`) so the panel loads on
+        // stable Omarchy 4.0.x as well as current dev builds.
         contentWidth: panel.fittedContentWidth(Style.space(420))
-        contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(560))
+        contentHeight: panel.fittedContentHeight(layout.implicitHeight, Style.space(560))
 
-        content: PanelKeyCatcher {
+        PanelKeyCatcher {
             id: keyCatcher
-            property alias panelFlick: panelFlick
-            implicitHeight: layout.implicitHeight
             anchors.fill: parent
             blocked: confirmation.opened
             onMoveRequested: function(dx, dy) {

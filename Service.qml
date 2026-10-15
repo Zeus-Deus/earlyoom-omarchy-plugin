@@ -23,7 +23,6 @@ Item {
     property int workerGeneration: 0
     // Status polls are not mutations; only real work dims the rows.
     readonly property bool mutating: busy && request.op !== "status" && request.op !== "kills" && request.op !== "apply"
-    readonly property bool watchApps: Model.hasAppRules(status)
 
     signal completed(string op, var result, var request)
 
@@ -115,10 +114,10 @@ Item {
 
     // A protected app's new window lands in app.slice like any other; move
     // it out shortly after it maps. Debounced so a burst of windows costs one
-    // bridge run. Nothing runs here when no app is protected.
+    // short bridge run. The same run remembers which app owns which scope,
+    // so a later systemd-oomd kill line can be shown with the app's name.
     Connections {
         target: Hyprland
-        enabled: root.watchApps
         function onRawEvent(event) {
             if (event && Model.isWindowEvent(String(event.name))) applyDebounce.restart();
         }
