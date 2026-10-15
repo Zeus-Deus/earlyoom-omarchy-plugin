@@ -55,6 +55,7 @@ def add_proc(root, pid, ppid, comm, cgroup, rss_pages=100):
     (d / "cgroup").write_text("0::%s\n" % cgroup)
     (d / "stat").write_text("%d (%s) S %d 0 0\n" % (pid, comm, ppid))
     (d / "statm").write_text("1000 %d 0 0 0 0 0\n" % rss_pages)
+    (d / "status").write_text("Name:\t%s\nRssAnon:\t%d kB\n" % (comm, rss_pages * 4))
 
 
 # ---------------------------------------------------------------- rules.py
@@ -127,7 +128,8 @@ def test_inventory_follows_a_browser_across_two_scopes(env, monkeypatch):
     apps = b.app_inventory(MANAGER)
     assert len(apps) == 1
     a = apps[0]
-    assert a["name"] == "Chromium" and a["memBytes"] == 400 << 20
+    # private memory of the three processes (100 + 5000 + 100 pages), not cgroup charges
+    assert a["name"] == "Chromium" and a["memBytes"] == 5200 * 4096
     assert sorted(a["exposed"]) == sorted(["app-org.chromium.Chromium-10.scope", "app-Hyprland-chromium-a63f68f7.scope"])
     assert a["comms"][0] == "chromium" and not a["guarded"]
 
@@ -143,7 +145,7 @@ def test_session_slice_and_zombies_never_count_as_part_of_an_app(env, monkeypatc
     monkeypatch.setattr(b, "hypr_clients", lambda: [{"class": "org.gnome.Nautilus", "pid": 15}])
     monkeypatch.setattr(b, "desktop_names", lambda: {})
     a = b.app_inventory(MANAGER)[0]
-    assert a["scopes"] == [own] and a["memBytes"] == 170 << 20
+    assert a["scopes"] == [own] and a["memBytes"] == 100 * 4096
     assert "Hyprland" not in a["comms"]
 
 

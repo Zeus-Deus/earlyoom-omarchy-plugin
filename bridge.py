@@ -368,18 +368,32 @@ def rss_of(pid):
     return int(tok[1]) * 4096 if len(tok) > 1 and tok[1].isdigit() else 0
 
 
-def heavy_comms(scopes, first):
-    """Process names that hold the app's memory, biggest first. earlyoom picks
-    single processes, so the name it would kill is often a child (a browser
-    renderer, the program running inside a terminal), not the window's own."""
-    by_name = {}
+def anon_of(pid):
+    """Private (anonymous) resident memory of one process, in bytes."""
+    for line in read_sys(os.path.join(proc_root(), str(int(pid)), "status"), 8192).splitlines():
+        if line.startswith("RssAnon:"):
+            tok = line.split()
+            return int(tok[1]) * 1024 if len(tok) > 1 and tok[1].isdigit() else 0
+    return 0
+
+
+def app_processes(scopes, first):
+    """(memory, names) for an app. Memory is the sum of each process's
+    private resident memory: cgroup memory.current is wrong right after a
+    protect, because pages stay charged to the cgroup that allocated them.
+    Names are the processes that hold the memory, biggest first. earlyoom
+    picks single processes, so the name it would kill is often a child (a
+    browser renderer, the program inside a terminal), not the window's own."""
+    by_name, total = {}, 0
     for cg in scopes:
         for pid in cg_pids(cg)[:2000]:
             name = comm_of(pid)
+            anon = anon_of(pid)
+            total += anon
             if name:
-                by_name[name] = by_name.get(name, 0) + rss_of(pid)
+                by_name[name] = by_name.get(name, 0) + max(anon, rss_of(pid))
     ordered = [first] + [n for n, _ in sorted(by_name.items(), key=lambda kv: -kv[1]) if n != first]
-    return R.clean_comms(ordered)
+    return total, R.clean_comms(ordered)
 
 
 def app_inventory(manager, kids=None):
@@ -408,12 +422,8 @@ def app_inventory(manager, kids=None):
                 row["scopes"].append(cg)
     out = []
     for row in rows.values():
-        mem = swap = 0
-        for cg in row["scopes"]:
-            m, s = cg_mem(cg)
-            mem += m
-            swap += s
-        row["comms"] = heavy_comms(row["scopes"], row["comms"][0] if row["comms"] else "")
+        swap = sum(cg_mem(cg)[1] for cg in row["scopes"])
+        mem, row["comms"] = app_processes(row["scopes"], row["comms"][0] if row["comms"] else "")
         row["memBytes"], row["swapBytes"] = mem, swap
         row["exposed"] = [cg.rsplit("/", 1)[-1] for cg in row["scopes"] if movable(cg, manager)]
         row["guarded"] = any(is_guarded(cg) for cg in row["scopes"]) and not row["exposed"]
