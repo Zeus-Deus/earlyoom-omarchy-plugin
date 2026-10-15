@@ -55,7 +55,7 @@ def add_proc(root, pid, ppid, comm, cgroup, rss_pages=100):
     (d / "cgroup").write_text("0::%s\n" % cgroup)
     (d / "stat").write_text("%d (%s) S %d 0 0\n" % (pid, comm, ppid))
     (d / "statm").write_text("1000 %d 0 0 0 0 0\n" % rss_pages)
-    (d / "status").write_text("Name:\t%s\nRssAnon:\t%d kB\n" % (comm, rss_pages * 4))
+    (d / "status").write_text("Name:\t%s\nRssAnon:\t%d kB\nVmSwap:\t%d kB\n" % (comm, rss_pages * 2, rss_pages * 2))
 
 
 # ---------------------------------------------------------------- rules.py

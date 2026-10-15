@@ -369,12 +369,14 @@ def rss_of(pid):
 
 
 def anon_of(pid):
-    """Private (anonymous) resident memory of one process, in bytes."""
+    """Private memory of one process in bytes: resident (RssAnon) plus what
+    is swapped out (VmSwap). Both count toward what OOM killers act on."""
+    total = 0
     for line in read_sys(os.path.join(proc_root(), str(int(pid)), "status"), 8192).splitlines():
-        if line.startswith("RssAnon:"):
+        if line.startswith("RssAnon:") or line.startswith("VmSwap:"):
             tok = line.split()
-            return int(tok[1]) * 1024 if len(tok) > 1 and tok[1].isdigit() else 0
-    return 0
+            total += int(tok[1]) * 1024 if len(tok) > 1 and tok[1].isdigit() else 0
+    return total
 
 
 def app_processes(scopes, first):
