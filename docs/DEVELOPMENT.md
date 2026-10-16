@@ -1,6 +1,73 @@
 # OOM Guard: development notes
 
-Reference for contributors. Nothing here runs as part of the plugin.
+Reference for contributors and reviewers. Nothing here runs as part of the plugin.
+
+## How it works
+
+Omarchy turns on **systemd-oomd**. When memory or swap runs out it kills one
+whole app, but only apps inside `app.slice`, the group that every app you
+launch lands in. The compositor and the shell live in `session.slice`, so they
+are never picked.
+
+Protecting an app moves its processes into a group of their own,
+`oomguard.slice`, next to `app.slice`. systemd-oomd does not watch it. This is
+a normal call to your own systemd user manager and needs no password. A
+protected service gets a small drop-in, `~/.config/systemd/user/<unit>.d/50-oomguard.conf`,
+with `Slice=oomguard.slice`.
+
+### Two killers, one list
+
+| | systemd-oomd | earlyoom |
+|---|---|---|
+| Comes from | Omarchy turns it on | You install it (`omarchy pkg add earlyoom`) |
+| Acts when | swap is over 90 % full, or memory stalls for 20 s | free memory and free swap both fall under 10 % |
+| Kills | one whole app | the single biggest process |
+| Covers | apps launched in your desktop session | every process, on desktops and headless servers |
+
+They do not conflict. On a desktop with a large swap file, systemd-oomd
+usually acts first; earlyoom is the backstop that also works on servers and
+over SSH, where Omarchy's setup does not apply. OOM Guard keeps one list and
+applies it to both.
+
+**earlyoom** picks single processes by name and score. The panel keeps your
+list in `~/.config/oomguard/protected.json`. The optional helper is a root
+systemd path unit that turns that list into earlyoom's `--ignore` option and
+restarts earlyoom when the list changes. It also always adds the desktop itself
+(Hyprland, the Omarchy shell and Xwayland). Without that, earlyoom's next
+choice after your protected apps is often the shell: in testing, it killed the
+bar eleven times in two minutes until Omarchy stopped restarting it.
+
+### Limits
+
+- A protected app can still be the one using up memory. Then systemd-oomd
+  picks something else, and if nothing else helps, the kernel's own OOM killer
+  decides. Protect the apps you work in, not everything.
+- earlyoom only matches process names. Protecting Obsidian adds `electron`,
+  which also covers other Electron apps with that name, and protecting a
+  terminal app adds `foot`, which covers every foot window. A single window
+  adds the name of the program inside it (`herdr`), so for earlyoom it covers
+  every process with that name.
+- A window that shares its process with other windows (a `foot --server`
+  setup, or several windows of one browser) cannot be protected alone; protect
+  the app instead. The panel says so on the row.
+- Windows of a protected app that open while the shell is not running are
+  protected a few seconds after the shell starts.
+
+## Security details
+
+- The panel never runs anything as root. **Link…**, **Turn on/off…**,
+  **Install…** and **Remove…** open Omarchy's terminal with one fixed
+  command each (`sudo bash <plugin>/helper/install.sh`,
+  `sudo systemctl enable|disable --now earlyoom.service`,
+  `omarchy pkg add|drop earlyoom`), and you type your own password there.
+  None of those commands is built from window titles, settings or the list.
+- The root helper reads each user's list as a regular file, without following
+  symlinks, and with a size limit. It accepts only names made of
+  `A-Z a-z 0-9 . _ + -`, at most 15 characters each, and refuses interpreters
+  such as `python3` or `bash`. A list can only add names for earlyoom to skip.
+  It cannot stop earlyoom or change its other options.
+- The plugin makes no network connections: no telemetry and no update check.
+- Every process the shell starts goes through a fixed output cap.
 
 ## Files
 
@@ -79,6 +146,19 @@ environment overrides. They never touch the real ones.
   moved within seconds of startup.
 - Unprotect: Enter opens the dialog with Cancel selected. Enter cancels. Right + Enter
   moves the app back to `app-graphical.slice`.
+- Single window: three foot windows (a `herdr` process, `nvim`, `btop`). Enter on the
+  `herdr` row moved only that window's processes into `oomguard.slice`; the other two
+  stayed in `app.slice`. A second, unprotected foot window then filled memory:
+  earlyoom killed it, `herdr` survived. Protecting a window through real keys took
+  effect in 14 of 15 tries, including 8 of 8 after a VM reboot. One early try did not
+  take and could not be reproduced.
+- A protected window that itself held memory at 96 % swap for 3 minutes was not
+  touched by systemd-oomd.
+- `f` focused the window on another workspace; `w` folded and unfolded an app's
+  windows without changing protection. Closing a window dropped its rule.
+- Killers tab: after a plugin update the earlyoom link was reported out of date;
+  Relink (Enter on the card) opened Omarchy's terminal, ran the helper, and earlyoom's
+  `--ignore` then included `herdr`.
 
 Not verified: the memory-pressure kill path of systemd-oomd (only the swap path was
 driven), multiple users with one earlyoom, and a current Omarchy dev build.
