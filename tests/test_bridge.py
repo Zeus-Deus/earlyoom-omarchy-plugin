@@ -855,3 +855,20 @@ def test_yielding_restarts_an_earlyoom_still_running_our_list(tmp_path, monkeypa
     (tmp_path / "stamp").unlink()
     monkeypatch.setattr(h, "running_ignore", lambda: (True, "^(sshd)$"))
     assert h.main() == 0 and not restarts
+
+
+def test_root_helper_expands_wildcard_environment_files(tmp_path, monkeypatch):
+    h = load_helper()
+    d = tmp_path / "earlyoom.d"
+    d.mkdir()
+    (d / "a.conf").write_text("X=1\n")
+    (d / "b.conf").write_text('EARLYOOM_ARGS="--ignore ^(sshd)$"\n')
+    monkeypatch.setattr(h, "ADMIN_ENV", str(tmp_path / "none"))
+
+    class P:
+        returncode = 0
+        stdout = "Environment=\nEnvironmentFiles=%s/*.conf (ignore_errors=no)\n" % d
+    monkeypatch.setattr(h.subprocess, "run", lambda *a, **k: P())
+    assert h.admin_has_ignore()
+    (d / "b.conf").unlink()
+    assert not h.admin_has_ignore()

@@ -20,6 +20,7 @@ never overrides theirs.
 A list can only make earlyoom skip process names. It cannot stop earlyoom,
 change thresholds or add other options.
 """
+import glob
 import os
 import pwd
 import stat
@@ -93,7 +94,15 @@ def admin_has_ignore():
             texts.append(line[len("Environment="):])
         elif line.startswith("EnvironmentFiles="):
             path = line[len("EnvironmentFiles="):].split(" (", 1)[0].strip()
-            if path and path != ENV_FILE:
+            if not path or path == ENV_FILE:
+                continue
+            if any(ch in path for ch in "*?["):
+                # systemd expands wildcards in EnvironmentFile=; so do we.
+                matches = glob.glob(path)
+                if len(matches) > 256:
+                    return True
+                files.update(m for m in matches if m != ENV_FILE)
+            else:
                 files.add(path)
     for path in sorted(files):
         try:
