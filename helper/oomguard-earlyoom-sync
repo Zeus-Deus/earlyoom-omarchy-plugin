@@ -176,7 +176,11 @@ def main():
     else:
         print("earlyoom protected process names: " + (", ".join(sorted(names)) or "none"))
     # try-restart: only if earlyoom is running; never starts a stopped one.
-    subprocess.run(["systemctl", "try-restart", "earlyoom.service"], check=False, timeout=30)
+    # A failure fails this run, so the panel shows it instead of "linked".
+    p = subprocess.run(["systemctl", "try-restart", "earlyoom.service"], check=False, timeout=30)
+    if p.returncode != 0:
+        print("earlyoom did not restart (exit %d)" % p.returncode, file=sys.stderr)
+        return 1
     return 0
 
 

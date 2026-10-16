@@ -8,7 +8,6 @@ root side build the same string. Pure stdlib, no I/O beyond what callers pass.
 """
 import json
 import re
-import shlex
 
 MARKER = "# Managed by OOM Guard (io.github.zeus-deus.oomguard)."
 MAX_RULES = 64
@@ -146,23 +145,25 @@ def earlyoom_omitted(rules):
 
 
 def admin_ignore(text):
-    """True when an /etc/default/earlyoom text passes earlyoom its own
-    --ignore. Only the EARLYOOM_ARGS assignments count, parsed the way a shell
-    would, and only the exact option (not --ignore-root-user, not a comment)."""
+    """True when /etc/default/earlyoom may pass earlyoom its own --ignore.
+
+    Deliberately fails closed rather than re-implementing systemd's
+    environment-file parser (spaces around "=", quoting, line continuations):
+    any "--ignore" option anywhere outside a whole-line comment counts. Only
+    the separate option --ignore-root-user is told apart. A false positive just
+    means OOM Guard adds nothing and the panel says the administrator's list
+    is in charge; a false negative would override it."""
+    continued = False
     for line in str(text or "").splitlines():
-        line = line.strip()
-        if line.startswith("export "):
-            line = line[7:].lstrip()
-        if not line.startswith("EARLYOOM_ARGS="):
+        stripped = line.strip()
+        comment = not continued and stripped[:1] in ("#", ";")
+        continued = line.rstrip().endswith("\\")
+        if comment:
             continue
-        try:
-            outer = shlex.split(line[len("EARLYOOM_ARGS="):], comments=True)
-            args = shlex.split(" ".join(outer), comments=True)
-        except ValueError:
-            return True  # unreadable: assume the administrator is in charge
-        if any(a == "--ignore" or a.startswith("--ignore=") for a in args):
+        if re.search(r"--ignore(?![-A-Za-z0-9_])", line):
             return True
     return False
+
 
 
 def regex_for_names(names):
