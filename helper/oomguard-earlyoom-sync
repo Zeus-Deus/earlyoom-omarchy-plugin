@@ -85,7 +85,7 @@ def admin_has_ignore():
             text = f.read(MAX_BYTES)
     except OSError:
         return False
-    return any("--ignore" in line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    return R.admin_ignore(text)
 
 
 def running_ignore():
@@ -108,12 +108,25 @@ def running_ignore():
 
 
 def write_env(text):
+    """Replace the env file, but only one OOM Guard wrote (marker on its first
+    line). Returns False, changing nothing, for anything else at that path."""
     try:
-        with open(ENV_FILE, encoding="utf-8") as f:
-            if f.read(MAX_BYTES) == text:
-                return
+        fd = os.open(ENV_FILE, FLAGS)
+    except FileNotFoundError:
+        fd = None
     except OSError:
-        pass
+        return False
+    if fd is not None:
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return False
+            old = os.read(fd, MAX_BYTES).decode("utf-8", "replace")
+        finally:
+            os.close(fd)
+        if old == text:
+            return True
+        if not old.startswith(R.MARKER + "\n"):
+            return False
     tmp = ENV_FILE + ".tmp"
     try:
         os.unlink(tmp)
@@ -123,6 +136,7 @@ def write_env(text):
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(text)
     os.replace(tmp, ENV_FILE)
+    return True
 
 
 def restart_allowed():
@@ -146,7 +160,9 @@ def main():
     if any(not (ch.isalnum() or ch in "^$()|[]._+-") for ch in regex):
         print("refusing unexpected character in regex", file=sys.stderr)
         return 1
-    write_env(R.MARKER + "\nOOMGUARD_ARGS=%s\n" % ("--ignore " + regex if regex else ""))
+    if not write_env(R.MARKER + "\nOOMGUARD_ARGS=%s\n" % ("--ignore " + regex if regex else "")):
+        print("%s was not written by OOM Guard; leaving it alone" % ENV_FILE, file=sys.stderr)
+        return 1
     running, have = running_ignore()
     if not running or have == regex or (yielded and have):
         return 0

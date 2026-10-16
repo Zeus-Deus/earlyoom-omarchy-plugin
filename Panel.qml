@@ -25,7 +25,7 @@ Panel {
     property string confirmKind: ""
     property string confirmKey: ""
     property string confirmAction: ""
-    property var expanded: ({})
+    property var expanded: Object.create(null)
 
     readonly property var status: service.status
     readonly property var rows: tab === "apps" ? Model.appRows(status, expanded)
@@ -116,7 +116,7 @@ Panel {
     }
     function toggleExpanded(row) {
         if (!row || row.kind !== "app" || !row.expandable) return;
-        var next = {};
+        var next = Object.create(null);  // window classes are external strings
         for (var k in expanded) next[k] = expanded[k];
         next[row.key] = !row.expanded;
         expanded = next;
@@ -166,12 +166,14 @@ Panel {
         onCompleted: function(op, result, req) {
             if (!result.ok) {
                 if (op !== "status" || !root.status) root.errorText = Model.sanitize(result.error, 160);
+                // A failed change keeps its rule; show the real state again.
+                if (op === "protect" || op === "unprotect") service.refresh();
                 return;
             }
             if (op === "protect" || op === "unprotect" || op === "restart_service") {
                 root.errorText = (result.errors && result.errors.length) ? Model.sanitize(result.errors[0].error, 160) : "";
                 if (op === "protect" && result.kind !== "service" && !(result.errors && result.errors.length))
-                    root.flash("Protected " + Model.sanitize(result.name, 40));
+                    root.flash(result.warning ? Model.sanitize(result.warning, 120) : "Protected " + Model.sanitize(result.name, 40));
                 if (op === "restart_service") root.flash("Restarted " + Model.sanitize(result.key, 40));
                 service.refresh();
                 if (root.tab === "killers") service.loadKills();

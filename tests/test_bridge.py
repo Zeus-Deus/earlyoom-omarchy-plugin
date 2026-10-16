@@ -622,3 +622,157 @@ def test_root_files_carry_the_ownership_marker():
         assert R.MARKER in src and 'ours "$f"' in src
     # No user-triggered activation: a fixed timer, no path unit shipped.
     assert not os.path.exists(os.path.join(ROOT, "helper", "oomguard-earlyoom-sync.path"))
+
+
+
+# ---------------------------------------------------------------- second review
+
+def gui_in_terminal(env, monkeypatch, b, where="oomguard.slice/oomguard-t.scope"):
+    """foot (50) -> bash (51) -> imv (52, its own window) and make (53)."""
+    scope = add_cgroup(env, where, [50, 51, 52, 53])
+    for pid, ppid, comm in ((50, 1, "foot"), (51, 50, "bash"), (52, 51, "imv"), (53, 51, "make")):
+        add_proc(env, pid, ppid, comm, scope)
+    monkeypatch.setattr(b, "hypr_clients", lambda: [
+        {"class": "foot", "pid": 50, "address": "0xaa", "title": "t", "workspace": {"id": 1, "name": "1"}},
+        {"class": "imv", "pid": 52, "address": "0xbb", "title": "pic", "workspace": {"id": 1, "name": "1"}}])
+    monkeypatch.setattr(b, "desktop_names", lambda: {})
+
+
+def record_busctl(monkeypatch, b):
+    calls = []
+
+    def fake(*args, **k):
+        method = args[0]
+        if method == "StartTransientUnit":
+            n = int(args[5 + 2])  # "PIDs" "au" <n> pids...
+            calls.append((method, sorted(int(x) for x in args[8:8 + n])))
+        else:
+            n = int(args[3])
+            calls.append((method, sorted(int(x) for x in args[4:4 + n])))
+        return 0, "", ""
+    monkeypatch.setattr(b, "busctl_user", fake)
+    return calls
+
+
+def test_the_fork_sweep_never_takes_a_protected_window_back(env, monkeypatch):
+    b = load_bridge()
+    gui_in_terminal(env, monkeypatch, b)
+    (env / "cfg" / "protected.json").write_text(R.dump_rules([
+        {"kind": "app", "key": "foot", "name": "Foot", "comms": ["foot"]},
+        {"kind": "app", "key": "imv", "name": "Imv", "comms": ["imv"]}]))
+    calls = record_busctl(monkeypatch, b)
+    res = b.op_unprotect({"kind": "app", "key": "foot"})
+    assert res["ok"]
+    moved = [p for _, pids in calls for p in pids]
+    assert 52 not in moved and sorted(moved) == [50, 51, 53]
+
+
+def test_protecting_a_terminal_does_not_sweep_in_its_gui_window(env, monkeypatch):
+    b = load_bridge()
+    gui_in_terminal(env, monkeypatch, b, where="app.slice/app-graphical.slice/app-Hyprland-foot-aaaaaaaa.scope")
+    calls = record_busctl(monkeypatch, b)
+    assert b.op_protect({"kind": "app", "key": "foot"})["ok"]
+    moved = [p for _, pids in calls for p in pids]
+    assert 52 not in moved and sorted(moved) == [50, 51, 53]
+
+
+def test_a_failed_unprotect_keeps_the_rule_for_a_retry(env, monkeypatch):
+    b = load_bridge()
+    gui_in_terminal(env, monkeypatch, b)
+    (env / "cfg" / "protected.json").write_text(R.dump_rules([{"kind": "app", "key": "foot", "name": "Foot", "comms": ["foot"]}]))
+    monkeypatch.setattr(b, "busctl_user", lambda *a, **k: (1, "", "Access denied"))
+    res = b.op_unprotect({"kind": "app", "key": "foot"})
+    assert not res["ok"] and [r["key"] for r in b.load_rules()] == ["foot"]
+    calls = record_busctl(monkeypatch, b)
+    assert b.op_unprotect({"kind": "app", "key": "foot"})["ok"] and calls and b.load_rules() == []
+
+
+def test_a_failed_reload_keeps_the_service_protected(env, monkeypatch):
+    b = load_bridge()
+    d = env / "sd" / "x.service.d"
+    d.mkdir(parents=True)
+    (d / "50-oomguard.conf").write_text(b.DROPIN_MARKER + "\n[Service]\nSlice=oomguard.slice\n")
+    (env / "cfg" / "protected.json").write_text(R.dump_rules([{"kind": "service", "key": "x.service", "name": "x", "comms": []}]))
+    monkeypatch.setattr(b, "run", lambda argv, **k: (1, "", "boom"))
+    assert not b.op_unprotect({"kind": "service", "key": "x.service"})["ok"]
+    assert (d / "50-oomguard.conf").exists() and b.load_rules()
+
+
+def test_unmoved_new_processes_are_reported_not_hidden(env, monkeypatch):
+    b = load_bridge()
+    scope = add_cgroup(env, "app.slice/app-x.scope", [80, 81])
+    add_proc(env, 80, 1, "x", scope)
+    add_proc(env, 81, 80, "x", scope)
+    monkeypatch.setattr(b, "busctl_user", lambda m, *a, **k: (0, "", "") if m == "StartTransientUnit" else (1, "", "nope"))
+    res = b.move_pids([(80, b.start_of(80))], b.GUARD_SLICE, "x", lambda: [(81, b.start_of(81))])
+    assert not res["ok"] and res["left"] == 1 and "nope" in res["error"]
+
+
+def test_run_kills_what_the_child_left_behind():
+    b = load_bridge()
+    marker = "oomguard-test-%d" % os.getpid()
+    # The descendant lets go of the pipes, so the call returns at once; it
+    # must still not outlive it.
+    code, _, _ = b.run(["/usr/bin/bash", "-c", "(exec -a %s sleep 30) >/dev/null 2>&1 & exit 0" % marker], timeout=5)
+    import time as _t
+    _t.sleep(0.2)
+    alive = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True).stdout.strip()
+    assert code == 0 and alive == ""
+    # One that keeps the pipe open hits the deadline and is killed with it.
+    code, _, _ = b.run(["/usr/bin/bash", "-c", "(exec -a %s sleep 30) & exit 0" % marker], timeout=0.5)
+    _t.sleep(0.2)
+    alive = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True).stdout.strip()
+    assert code == 124 and alive == ""
+
+
+@pytest.mark.parametrize("text,yes", [
+    ('EARLYOOM_ARGS="-r 3600 --ignore-root-user"\n', False),
+    ('EARLYOOM_ARGS="-r 3600" # we used --ignore once\n', False),
+    ('# EARLYOOM_ARGS="--ignore x"\n', False),
+    ('EARLYOOM_ARGS="-r 3600 --ignore \'^(sshd)$\'"\n', True),
+    ("export EARLYOOM_ARGS='--ignore=^(x)$'\n", True),
+])
+def test_admin_ignore_means_the_exact_option(text, yes):
+    assert R.admin_ignore(text) is yes
+
+
+def test_names_over_the_quota_are_reported():
+    rules = [{"kind": "app", "key": "k%d" % i, "comms": ["n%02d" % i]} for i in range(33)]
+    assert R.earlyoom_omitted(rules) == ["n32"]
+    assert "n32" not in R.earlyoom_names(rules) and "n00" in R.earlyoom_names(rules)
+
+
+def test_kill_counts_are_a_lower_bound_only_when_journalctl_had_more(monkeypatch):
+    b = load_bridge()
+    monkeypatch.setattr(b, "launcher_map", lambda since: {})
+    seen = []
+
+    def fake(argv, **k):
+        seen.append(argv)
+        return 0, "", ""
+    monkeypatch.setattr(b, "run", fake)
+    res = b.op_kills({"days": 30})
+    assert res["capped"] == {"systemd-oomd": False, "earlyoom": False}
+    eo = next(a for a in seen if "earlyoom.service" in a)
+    assert ("uid %d " % os.getuid()) in eo[eo.index("-g") + 1]
+
+
+def test_status_flags_stale_names(env, monkeypatch):
+    b = load_bridge()
+    terminal_fixture(env, monkeypatch, b)
+    (env / "cfg" / "protected.json").write_text(R.dump_rules(
+        [{"kind": "window", "key": "0xbb", "name": "Foot · vim", "comms": ["old"], "pid": 60, "start": 1060}]))
+    monkeypatch.setattr(b, "systemctl_show", lambda *a: {})
+    assert b.op_status({})["commsStale"]
+
+
+def test_root_sync_never_replaces_an_unmarked_env_file(tmp_path, monkeypatch):
+    h = load_helper()
+    f = tmp_path / "earlyoom.env"
+    f.write_text("OOMGUARD_ARGS=--ignore ^(sshd)$\n")
+    monkeypatch.setattr(h, "ENV_FILE", str(f))
+    assert h.write_env(R.MARKER + "\nOOMGUARD_ARGS=\n") is False
+    assert f.read_text() == "OOMGUARD_ARGS=--ignore ^(sshd)$\n"
+    f.write_text(R.MARKER + "\nOOMGUARD_ARGS=\n")
+    assert h.write_env(R.MARKER + "\nOOMGUARD_ARGS=--ignore ^(x)$\n") is True
+    assert "^(x)$" in f.read_text()

@@ -40,6 +40,7 @@ RETURN_SLICE = "app-graphical.slice"
 DROPIN_NAME = "50-oomguard.conf"
 DROPIN_MARKER = "# Managed by OOM Guard (io.github.zeus-deus.oomguard)."
 SYNC_TIMER_UNIT = "oomguard-earlyoom-sync.timer"
+SYNC_SERVICE_UNIT = "oomguard-earlyoom-sync.service"
 OLD_PATH_UNIT = "oomguard-earlyoom-sync.path"  # OOM Guard 0.1.x
 KILL_DAYS_MAX = 30
 # Hard end for one bridge run, above the panel's own 50 s deadline: a bridge
@@ -82,17 +83,33 @@ def earlyoom_dropin():
 
 # ---------------------------------------------------------------- io helpers
 
+# Children not yet reaped. Their pid is still reserved (a zombie keeps it),
+# so killing their process group can never hit an unrelated process.
+_CHILDREN = set()
+
+
+def kill_children():
+    for pid in list(_CHILDREN):
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
 def run(argv, timeout=4, cap=2 * 1024 * 1024, errcap=4096):
     """Run a fixed argv (never a shell). Returns (code, stdout, stderr).
 
-    Output is capped while it is read, not after: past `cap` bytes the child's
-    whole process group is killed (exit 125), so a huge journal or client list
-    never sits in this process's memory."""
+    Output is capped while it is read, not after: past `cap` bytes the run
+    stops (exit 125), so a huge journal or client list never sits in this
+    process's memory. The child runs in its own process group, and that whole
+    group is killed before the child is reaped, so nothing it started outlives
+    the call."""
     try:
         p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              start_new_session=True)
     except FileNotFoundError:
         return 127, "", "not found"
+    _CHILDREN.add(p.pid)
     ofd, efd = p.stdout.fileno(), p.stderr.fileno()
     bufs = {ofd: [], efd: []}
     sizes = {ofd: 0, efd: 0}
@@ -118,22 +135,27 @@ def run(argv, timeout=4, cap=2 * 1024 * 1024, errcap=4096):
                     status = 125
                     open_fds.clear()
                     break
-        if status is None:
-            try:
-                status = p.wait(max(0.1, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
+        # Wait for the child to exit without reaping it (WNOWAIT).
+        while status is None:
+            if os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is not None:
+                break
+            if time.monotonic() >= deadline:
                 status = 124
+                break
+            time.sleep(0.005)
     finally:
-        if p.poll() is None:
-            try:
-                os.killpg(p.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            p.wait()
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        p.wait()
+        _CHILDREN.discard(p.pid)
         p.stdout.close()
         p.stderr.close()
     if status == 124:
         return 124, "", "timed out"
+    if status is None:
+        status = p.returncode
     return (status, b"".join(bufs[ofd]).decode("utf-8", "replace"),
             b"".join(bufs[efd]).decode("utf-8", "replace"))
 
@@ -388,14 +410,20 @@ def move_pids(pids, dest_slice, label, leftovers):
     code, out, err = busctl_user("StartTransientUnit", "ssa(sv)a(sa(sv))", unit, "fail", "6", *props, "0")
     if code != 0:
         return {"ok": False, "error": clean(err or out or "StartTransientUnit failed", 160)}
-    left = []
+    left, attach_err = [], ""
     for _ in range(3):
         left = [p for p, st in leftovers() if st and start_of(p) == st]
         if not left:
             break
-        busctl_user("AttachProcessesToUnit", "ssau", unit, "/", str(len(left)), *[str(p) for p in left])
+        code, out, err = busctl_user("AttachProcessesToUnit", "ssau", unit, "/", str(len(left)), *[str(p) for p in left])
+        if code != 0:
+            attach_err = clean(err or out or "AttachProcessesToUnit failed", 160)
         time.sleep(0.05)
-    return {"ok": True, "unit": unit, "moved": len(pids), "left": len(leftovers()) if left else 0}
+    remaining = len([p for p, st in leftovers() if st and start_of(p) == st]) if left else 0
+    if remaining:
+        return {"ok": False, "unit": unit, "moved": len(pids), "left": remaining,
+                "error": attach_err or "%d new processes could not be moved yet" % remaining}
+    return {"ok": True, "unit": unit, "moved": len(pids), "left": 0}
 
 
 def ident(procs):
@@ -737,6 +765,10 @@ def package_info(name):
     return None
 
 
+def admin_defaults():
+    return env("OOMGUARD_EARLYOOM_DEFAULTS", "/etc/default/earlyoom")
+
+
 def helper_rules():
     return env("OOMGUARD_HELPER_RULES", "/usr/lib/oomguard/rules.py")
 
@@ -793,6 +825,12 @@ def earlyoom_state(rules, units):
             current = False
     installed = unit.get("LoadState") == "loaded"
     have = R.names_in_regex(running)
+    sync = units.get(SYNC_SERVICE_UNIT, {})
+    sync_failed = sync.get("ActiveState") == "failed" or sync.get("Result", "success") not in ("success", "")
+    try:
+        admin = R.admin_ignore(read_small(admin_defaults(), 65536))
+    except OSError:
+        admin = False
     return {"installed": installed, "active": active,
             "failed": unit.get("ActiveState") == "failed",
             "enabled": unit.get("UnitFileState") in ("enabled", "enabled-runtime", "static", "indirect", "alias"),
@@ -800,10 +838,15 @@ def earlyoom_state(rules, units):
             "package": package_info("earlyoom") if installed else None,
             "limits": earlyoom_limits(args) if active else None,
             "linked": linked, "helperCurrent": bool(current) if linked else True,
-            "syncWatching": timer.get("ActiveState") == "active" or old.get("ActiveState") == "active",
+            "syncWatching": (timer.get("ActiveState") == "active" or old.get("ActiveState") == "active") and not sync_failed,
+            "syncFailed": bool(linked and sync_failed),
+            # The administrator's own --ignore in /etc/default/earlyoom wins;
+            # the root helper then adds nothing.
+            "adminIgnore": bool(admin),
             # Other users' names may be in the regex too: applied = all of mine are.
-            "applied": bool(linked and active and mine <= have),
-            "names": sorted(mine), "runningIgnore": clean(running, 400)}
+            "applied": bool(linked and active and not admin and mine <= have),
+            "names": sorted(mine), "omitted": R.earlyoom_omitted(rules),
+            "runningIgnore": clean(running, 400)}
 
 
 def meminfo():
@@ -877,7 +920,7 @@ def launcher_map(since):
     """scope unit -> what was launched in it, from uwsm's own journal lines."""
     out = {}
     for e in journal_json(["journalctl", "--no-pager", "-q", "-o", "json", "--since", since,
-                           "_UID=%d" % os.getuid(), "-t", "uwsm_app-daemon", "-g", "sent: exec"], 2000):
+                           "_UID=%d" % os.getuid(), "-t", "uwsm_app-daemon", "-g", "sent: exec"], 2000)[0]:
         msg = str(e.get("MESSAGE") or "")
         m = re.search(r"--unit=([^' ]+)", msg)
         if not m or " -- " not in msg:
@@ -918,10 +961,13 @@ def op_status(req):
     manager = user_manager_cgroup()
     rules = load_rules()
     apps = app_inventory(manager)
-    units = systemctl_show(["systemd-oomd.service", "earlyoom.service", SYNC_TIMER_UNIT, OLD_PATH_UNIT],
-                           ["Id", "LoadState", "ActiveState", "UnitFileState", "MainPID", "ActiveEnterTimestamp"])
+    units = systemctl_show(["systemd-oomd.service", "earlyoom.service", SYNC_TIMER_UNIT, SYNC_SERVICE_UNIT, OLD_PATH_UNIT],
+                           ["Id", "LoadState", "ActiveState", "UnitFileState", "MainPID", "ActiveEnterTimestamp", "Result"])
     remember_scopes(apps)
     return {"ok": True, "rules": rules, "apps": public(apps), "services": service_inventory(manager),
+            # A protected app or window now runs something its rule does not
+            # name yet; the shell runs apply, which saves the new names.
+            "commsStale": refreshed_comms(rules, apps) != rules,
             "oomd": oomd_state(manager, units),
             "earlyoom": earlyoom_state(rules, units), "mem": meminfo(),
             "terminalAvailable": bool(which("omarchy-launch-floating-terminal-with-presentation"))}
@@ -949,29 +995,40 @@ def wanted_procs(rules, apps, only=None):
     return out
 
 
+def window_pids(apps):
+    return {w["pid"] for a in apps for w in a["windowList"]}
+
+
 def window_alive(rule, apps):
     return any(rule_matches(rule, w) for a in apps for w in a["windowList"])
 
 
-def move_set(procs, dest, label, manager):
+def move_set(procs, dest, label, manager, stop=frozenset()):
     """Move these processes of the user's own apps, re-reading them right
     before each step. Only transient app scopes are ever moved; a service's
-    processes never leave their service."""
+    processes never leave their service. `stop` holds pids that must not move
+    and whose children are not followed: other windows, and processes another
+    rule still covers. The sweep for children forked during the move honours
+    it too."""
     if dest == GUARD_SLICE:
         pick = lambda cg: movable(cg, manager)  # noqa: E731
     else:
         pick = lambda cg: cg.startswith(manager + "/" + GUARD_SLICE + "/") and cg.endswith(".scope")  # noqa: E731
-    ids = [(p, st) for p, st in ident(procs) if st and pick(pid_cgroup(p))]
+    ids = [(p, st) for p, st in ident(procs) if st and p not in stop and pick(pid_cgroup(p))]
     if not ids:
         return {"ok": True, "moved": 0}
     pids = {p for p, _ in ids}
 
     def leftovers():
         kids = process_children()
-        more = []
-        for p in list(pids):
-            for c in kids.get(p, []):
-                if c not in pids and pick(pid_cgroup(c)):
+        more, seen, todo = [], set(pids), list(pids)
+        while todo and len(seen) < 4000:
+            for c in kids.get(todo.pop(), []):
+                if c in seen or c in stop:
+                    continue
+                seen.add(c)
+                todo.append(c)
+                if pick(pid_cgroup(c)):
                     more.append((c, start_of(c)))
         return more
 
@@ -983,8 +1040,10 @@ def apply_rules(rules, manager, only=None):
     single windows that closed are dropped from the list."""
     moved, errors = [], []
     apps = app_inventory(manager)
+    wins = window_pids(apps)
     for r, procs in wanted_procs(rules, apps, only):
-        res = move_set(procs, GUARD_SLICE, r["name"], manager)
+        own = {p for p, _ in procs}
+        res = move_set(procs, GUARD_SLICE, r["name"], manager, stop=frozenset(wins - own))
         if not res.get("ok"):
             errors.append(dict(res, key=r["key"], name=r["name"]))
         elif res.get("moved"):
@@ -1088,10 +1147,16 @@ def op_protect(req):
         save_rules(rules)
         moved, errors, _ = apply_rules(rules, manager, only=(kind, key))
         result.update(moved=moved, errors=errors)
+        over = [c for c in rules[-1]["comms"] if c in R.earlyoom_omitted(rules)]
+        if over:
+            result["warning"] = "earlyoom skips at most %d names per user; %s not added" % (R.MAX_IGNORE_NAMES, ", ".join(over))
     return result
 
 
 def op_unprotect(req):
+    """Stop protecting one entry. The rule is only removed once its processes
+    are back (or its drop-in is gone and systemd reloaded); on failure it
+    stays, so the panel still shows it protected and a retry does the work."""
     kind = req.get("kind")
     key = str(req.get("key") or "")
     if kind not in ("app", "service", "window"):
@@ -1106,28 +1171,37 @@ def op_unprotect(req):
         result = {"ok": True, "kind": kind, "key": key, "errors": []}
         if kind == "service":
             if dropin_state(key) == "ours":
-                os.unlink(dropin_path(key))
-                try:
-                    os.rmdir(os.path.dirname(dropin_path(key)))
-                except OSError:
-                    pass
+                path = dropin_path(key)
+                text = read_small(path, 4096)
+                os.unlink(path)
                 code, _, err = run(["systemctl", "--user", "daemon-reload"], timeout=15)
                 if code != 0:
-                    result["errors"].append({"error": clean("systemd did not reload: " + (err or str(code)), 160)})
+                    atomic_write(path, text, 0o644)
+                    return {"ok": False, "error": clean("systemd did not reload: " + (err or str(code)), 160)}
+                try:
+                    os.rmdir(os.path.dirname(path))
+                except OSError:
+                    pass
                 result["restartNeeded"] = True
             save_rules(rest)
             return result
-        save_rules(rest)
         if target is None:
             return result
         apps = app_inventory(manager)
-        # Processes another remaining rule still covers stay protected.
+        # Processes another remaining rule still covers stay protected, and so
+        # do other windows: neither is moved nor followed.
         still = {p for _, procs in wanted_procs(rest, apps) for p, _ in procs}
         for _, procs in wanted_procs([target], apps):
+            own = {p for p, _ in procs}
             back = [pc for pc in procs if pc[0] not in still]
-            res = move_set(back, RETURN_SLICE, target["name"], manager)
+            res = move_set(back, RETURN_SLICE, target["name"], manager,
+                           stop=frozenset(still | (window_pids(apps) - own)))
             if not res.get("ok"):
                 result["errors"].append(dict(res, key=key, name=target["name"]))
+        if result["errors"]:
+            return {"ok": False, "kind": kind, "key": key, "errors": result["errors"],
+                    "error": "could not return every process: " + result["errors"][0].get("error", "")}
+        save_rules(rest)
     return result
 
 
@@ -1144,9 +1218,10 @@ def op_restart_service(req):
 
 
 def journal_json(argv, limit):
-    """Newest `limit` matching entries, newest first. journalctl itself stops
-    after `limit` records (-n with -r), and only the needed fields come back,
-    so the read is small however large the journal is."""
+    """Newest `limit` matching entries, newest first, and whether journalctl
+    had more. journalctl itself stops after `limit` records (-n with -r), and
+    only the needed fields come back, so the read is small however large the
+    journal is."""
     _, out, _ = run(argv + ["-r", "-n", str(int(limit)), "--output-fields=MESSAGE,USER_UNIT,UNIT,__REALTIME_TIMESTAMP"],
                     timeout=10, cap=2 * 1024 * 1024)
     rows = []
@@ -1157,7 +1232,7 @@ def journal_json(argv, limit):
             continue
         if isinstance(e, dict):
             rows.append(e)
-    return rows
+    return rows, len(rows) >= limit
 
 
 def op_kills(req):
@@ -1169,15 +1244,20 @@ def op_kills(req):
     known = load_scope_names()
     launched = launcher_map(since)
     kills = []
-    for e in journal_json(["journalctl", "--no-pager", "-q", "-o", "json", "--since", since,
-                           "_UID=%d" % os.getuid(), "_COMM=systemd", "-g", "systemd-oomd killed"], 500):
+    oomd_rows, oomd_more = journal_json(["journalctl", "--no-pager", "-q", "-o", "json", "--since", since,
+                                         "_UID=%d" % os.getuid(), "_COMM=systemd", "-g", "systemd-oomd killed"], 500)
+    # This user's earlyoom kills only, filtered by journalctl itself, so the
+    # 500-record limit counts this user's records, not everyone's.
+    eo_rows, eo_more = journal_json(["journalctl", "--no-pager", "-q", "-o", "json", "--since", since,
+                                     "-u", "earlyoom.service",
+                                     "-g", "sending SIG(TERM|KILL) to process [0-9]+ uid %d " % os.getuid()], 500)
+    for e in oomd_rows:
         unit = str(e.get("USER_UNIT") or e.get("UNIT") or "")
         m = re.search(r"killed (\d+) process", str(e.get("MESSAGE") or ""))
         kills.append({"by": "systemd-oomd", "name": scope_label(unit, known, launched), "unit": clean(unit, 120),
                       "processes": int(m.group(1)) if m else None,
                       "t": int(e.get("__REALTIME_TIMESTAMP") or 0) // 1000000})
-    for e in journal_json(["journalctl", "--no-pager", "-q", "-o", "json", "--since", since,
-                           "-u", "earlyoom.service", "-g", "sending SIG(TERM|KILL) to process"], 500):
+    for e in eo_rows:
         m = re.search(r'sending (SIG\w+) to process \d+ uid (\d+) "([^"]*)".*?VmRSS (\d+) MiB', str(e.get("MESSAGE") or ""))
         if not m or int(m.group(2)) != os.getuid():
             continue
@@ -1190,8 +1270,9 @@ def op_kills(req):
     for k in kills:
         counts[k["by"]] += 1
         last[k["by"]] = max(last[k["by"]], k["t"])
-    # Counts cover the newest 500 records of each killer; more is reported as "500+".
-    capped = {"systemd-oomd": counts["systemd-oomd"] >= 500, "earlyoom": counts["earlyoom"] >= 500}
+    # Counts cover the newest 500 records of each killer; if journalctl had
+    # more, the panel shows the count as a lower bound ("500+").
+    capped = {"systemd-oomd": oomd_more, "earlyoom": eo_more}
     return {"ok": True, "days": days, "total": len(kills), "counts": counts, "capped": capped,
             "last": last, "kills": kills[:60]}
 
@@ -1215,7 +1296,11 @@ OPS = {"status": op_status, "kills": op_kills, "protect": op_protect, "unprotect
 
 
 def main():
-    signal.signal(signal.SIGALRM, lambda *_: os._exit(124))
+    def deadline(*_):
+        kill_children()  # before exit releases the lock
+        os._exit(124)
+
+    signal.signal(signal.SIGALRM, deadline)
     signal.alarm(DEADLINE_S)
     raw = sys.stdin.buffer.read(MAX_REQUEST + 1)
     try:

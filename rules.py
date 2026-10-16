@@ -8,6 +8,7 @@ root side build the same string. Pure stdlib, no I/O beyond what callers pass.
 """
 import json
 import re
+import shlex
 
 MARKER = "# Managed by OOM Guard (io.github.zeus-deus.oomguard)."
 MAX_RULES = 64
@@ -124,13 +125,44 @@ def dump_rules(rules):
     return json.dumps({"version": 1, "protected": rules[:MAX_RULES]}, indent=2) + "\n"
 
 
-def earlyoom_names(rules):
-    names = set()
+def _ordered_names(rules):
+    out = []
     for r in rules:
         for c in r.get("comms") or []:
-            if ok_comm(c):
-                names.add(c)
-    return sorted(names)[:MAX_IGNORE_NAMES]
+            if ok_comm(c) and c not in out:
+                out.append(c)
+    return out
+
+
+def earlyoom_names(rules):
+    """This user's names for earlyoom, at most MAX_IGNORE_NAMES. The oldest
+    entries win, so adding one never drops a name that already worked."""
+    return sorted(_ordered_names(rules)[:MAX_IGNORE_NAMES])
+
+
+def earlyoom_omitted(rules):
+    """Names over the per-user limit, which earlyoom does not get."""
+    return _ordered_names(rules)[MAX_IGNORE_NAMES:]
+
+
+def admin_ignore(text):
+    """True when an /etc/default/earlyoom text passes earlyoom its own
+    --ignore. Only the EARLYOOM_ARGS assignments count, parsed the way a shell
+    would, and only the exact option (not --ignore-root-user, not a comment)."""
+    for line in str(text or "").splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if not line.startswith("EARLYOOM_ARGS="):
+            continue
+        try:
+            outer = shlex.split(line[len("EARLYOOM_ARGS="):], comments=True)
+            args = shlex.split(" ".join(outer), comments=True)
+        except ValueError:
+            return True  # unreadable: assume the administrator is in charge
+        if any(a == "--ignore" or a.startswith("--ignore=") for a in args):
+            return True
+    return False
 
 
 def regex_for_names(names):

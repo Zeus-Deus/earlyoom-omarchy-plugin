@@ -142,6 +142,14 @@ Item {
         interval: 1200
         onTriggered: root.applyNow()
     }
+    // Keeps earlyoom's names current while the panel is closed: a protected
+    // terminal can start another program without any window event.
+    Timer {
+        interval: 60000
+        repeat: true
+        running: true
+        onTriggered: if (root.status && (root.status.rules || []).length > 0) root.applyNow()
+    }
     // Apps that were already open when the shell started (login, restart).
     Timer {
         interval: 4000
@@ -150,6 +158,7 @@ Item {
     }
     onStatusChanged: {
         if (!status) return;
+        if (status.commsStale) { applyDebounce.restart(); return; }
         var apps = status.apps || [];
         for (var i = 0; i < apps.length; i++) {
             if ((apps[i].exposed || []).length > 0 && Model.ruleFor(status.rules, "app", apps[i].key)) {

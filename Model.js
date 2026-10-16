@@ -246,7 +246,8 @@ function killerCards(status, killsResult, now) {
     }
     var note = [];
     if (e.package) note.push("Your package " + sanitize(e.package.version, 20) + " · since " + sinceDate(e.package.installedAt));
-    if (e.installed && e.active && !e.linked) note.push("not linked to your list");
+    if (e.installed && e.active && e.adminIgnore) note.push("uses its own --ignore");
+    else if (e.installed && e.active && !e.linked) note.push("not linked to your list");
     else if (stale) note.push("link out of date");
     else if (e.linked && e.active) note.push(e.applied ? "follows your list" : "updating…");
     cards.push({
@@ -316,8 +317,14 @@ function killerNotice(status) {
         return {text: "earlyoom is running and does not know this list yet.", level: "warn", action: "link"};
     if (eo.active && eo.linked && eo.helperCurrent === false)
         return {text: "earlyoom's link is from an older OOM Guard. Relink to update it.", level: "warn", action: "link", label: "Relink…"};
+    if (eo.active && eo.linked && eo.syncFailed)
+        return {text: "The earlyoom link failed its last update. Relink to repair it.", level: "warn", action: "link", label: "Relink…"};
     if (eo.active && eo.linked && eo.syncWatching === false)
         return {text: "The earlyoom link is not running, so list changes do not reach earlyoom.", level: "warn", action: "link", label: "Relink…"};
+    if (eo.active && eo.adminIgnore)
+        return {text: "earlyoom uses its own --ignore from /etc/default/earlyoom, so it does not use this list.", level: "warn", action: ""};
+    if (eo.active && eo.linked && (eo.omitted || []).length > 0)
+        return {text: "earlyoom takes 32 names per user; it skips " + sanitize((eo.omitted || []).join(", "), 60) + ".", level: "warn", action: ""};
     if (eo.active && eo.linked && !eo.applied)
         return {text: "Updating earlyoom…", level: "ok", action: ""};
     var parts = [];
