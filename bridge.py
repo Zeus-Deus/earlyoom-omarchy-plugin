@@ -17,10 +17,13 @@ Two different killers can take an app down on Omarchy:
 
 Ops: status, kills, protect, unprotect, apply, restart_service.
 """
+import fcntl
 import json
 import os
 import re
 import secrets
+import select
+import signal
 import stat
 import subprocess
 import sys
@@ -36,8 +39,12 @@ GUARD_SLICE = "oomguard.slice"
 RETURN_SLICE = "app-graphical.slice"
 DROPIN_NAME = "50-oomguard.conf"
 DROPIN_MARKER = "# Managed by OOM Guard (io.github.zeus-deus.oomguard)."
-SYNC_PATH_UNIT = "oomguard-earlyoom-sync.path"
+SYNC_TIMER_UNIT = "oomguard-earlyoom-sync.timer"
+OLD_PATH_UNIT = "oomguard-earlyoom-sync.path"  # OOM Guard 0.1.x
 KILL_DAYS_MAX = 30
+# Hard end for one bridge run, above the panel's own 50 s deadline: a bridge
+# the panel stopped waiting for cannot keep running.
+DEADLINE_S = 55
 
 
 def env(name, default):
@@ -75,15 +82,60 @@ def earlyoom_dropin():
 
 # ---------------------------------------------------------------- io helpers
 
-def run(argv, timeout=4, cap=2 * 1024 * 1024):
-    """Run a fixed argv (never a shell). Returns (code, stdout, stderr)."""
+def run(argv, timeout=4, cap=2 * 1024 * 1024, errcap=4096):
+    """Run a fixed argv (never a shell). Returns (code, stdout, stderr).
+
+    Output is capped while it is read, not after: past `cap` bytes the child's
+    whole process group is killed (exit 125), so a huge journal or client list
+    never sits in this process's memory."""
     try:
-        p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
+        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             start_new_session=True)
     except FileNotFoundError:
         return 127, "", "not found"
-    except subprocess.TimeoutExpired:
+    ofd, efd = p.stdout.fileno(), p.stderr.fileno()
+    bufs = {ofd: [], efd: []}
+    sizes = {ofd: 0, efd: 0}
+    limits = {ofd: cap, efd: errcap}
+    open_fds, deadline, status = set(bufs), time.monotonic() + timeout, None
+    try:
+        while open_fds:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                status = 124
+                break
+            ready, _, _ = select.select(list(open_fds), [], [], left)
+            for fd in ready:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    open_fds.discard(fd)
+                    continue
+                room = limits[fd] - sizes[fd]
+                if room > 0:
+                    bufs[fd].append(chunk[:room])
+                sizes[fd] += len(chunk)
+                if fd == ofd and sizes[fd] > cap:
+                    status = 125
+                    open_fds.clear()
+                    break
+        if status is None:
+            try:
+                status = p.wait(max(0.1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                status = 124
+    finally:
+        if p.poll() is None:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            p.wait()
+        p.stdout.close()
+        p.stderr.close()
+    if status == 124:
         return 124, "", "timed out"
-    return p.returncode, p.stdout[:cap].decode("utf-8", "replace"), p.stderr[:4096].decode("utf-8", "replace")
+    return (status, b"".join(bufs[ofd]).decode("utf-8", "replace"),
+            b"".join(bufs[efd]).decode("utf-8", "replace"))
 
 
 def read_small(path, cap=65536):
@@ -144,6 +196,30 @@ clean = R.clean_text
 
 
 # ---------------------------------------------------------------- the list
+
+class mutation_lock:
+    """One writer at a time across bridge processes: a bridge the panel gave
+    up on (timeout) can still be running, and must not interleave with the
+    next request's changes."""
+
+    def __enter__(self):
+        os.makedirs(state_dir(), exist_ok=True)
+        self.fd = os.open(os.path.join(state_dir(), "lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    os.close(self.fd)
+                    raise RuntimeError("another OOM Guard change is still running")
+                time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        os.close(self.fd)
+        return False
+
 
 def rules_path():
     return os.path.join(config_dir(), "protected.json")
@@ -234,20 +310,32 @@ def app_owned(path, manager):
     return path.startswith(manager + "/app.slice/") or path.startswith(manager + "/" + GUARD_SLICE + "/")
 
 
+def start_of(pid):
+    """Process start time in clock ticks since boot (field 22 of stat). With
+    the pid it identifies one process; a reused pid gets a new start time."""
+    raw = read_sys(os.path.join(proc_root(), str(int(pid)), "stat"), 1024)
+    end = raw.rfind(")")
+    fields = raw[end + 2:].split() if end > 0 else []
+    return int(fields[19]) if len(fields) > 19 and fields[19].isdigit() else 0
+
+
 def is_zombie(pid):
     raw = read_sys(os.path.join(proc_root(), str(int(pid)), "stat"), 1024)
     end = raw.rfind(")")
     return end > 0 and raw[end + 2:end + 3] == "Z"
 
 
-def subtree(pid, kids, manager, limit=4000):
+def subtree(pid, kids, manager, limit=4000, stop=()):
     """Live processes of a window: its process and every descendant that is
     still in an app cgroup. Zombies are skipped: a launcher zombie reports the
-    cgroup of whoever started it (Hyprland's service), not the app's."""
+    cgroup of whoever started it (Hyprland's service), not the app's.
+    `stop` holds the pids of other windows: a GUI started from a terminal is
+    its own window and never part of the terminal's tree, or the other way
+    round."""
     seen, out, stack = set(), [], [pid]
     while stack and len(seen) < limit:
         p = stack.pop()
-        if p in seen:
+        if p in seen or (p != pid and p in stop):
             continue
         seen.add(p)
         if is_zombie(p):
@@ -286,6 +374,7 @@ def move_pids(pids, dest_slice, label, leftovers):
     processes that should have moved but forked during the call; they are
     swept with AttachProcessesToUnit, which systemd only allows on a delegated
     scope, hence Delegate=yes."""
+    pids = [p for p, st in pids if st and start_of(p) == st]  # (pid, start) pairs: skip reused pids
     if not pids:
         return {"ok": False, "error": "nothing left to move"}
     guard = dest_slice == GUARD_SLICE
@@ -301,7 +390,7 @@ def move_pids(pids, dest_slice, label, leftovers):
         return {"ok": False, "error": clean(err or out or "StartTransientUnit failed", 160)}
     left = []
     for _ in range(3):
-        left = leftovers()
+        left = [p for p, st in leftovers() if st and start_of(p) == st]
         if not left:
             break
         busctl_user("AttachProcessesToUnit", "ssau", unit, "/", str(len(left)), *[str(p) for p in left])
@@ -309,15 +398,28 @@ def move_pids(pids, dest_slice, label, leftovers):
     return {"ok": True, "unit": unit, "moved": len(pids), "left": len(leftovers()) if left else 0}
 
 
-def move_cgroup(src, dest_slice, label):
-    """Move every process of the cgroup `src`."""
-    pids = cg_pids(src)
-    if not pids:
-        return {"ok": False, "error": "nothing left to move in " + src.rsplit("/", 1)[-1]}
-    return move_pids(pids, dest_slice, label, lambda: cg_pids(src))
+def ident(procs):
+    return [(p, start_of(p)) for p, _ in procs]
 
 
 # ---------------------------------------------------------------- inventory
+
+def window_clients():
+    return [c for c in hypr_clients()
+            if R.CLASS_RE.fullmatch(str(c.get("class") or c.get("initialClass") or ""))
+            and isinstance(c.get("pid"), int) and not isinstance(c.get("pid"), bool) and c["pid"] > 1
+            and R.WINDOW_RE.fullmatch(str(c.get("address") or ""))]
+
+
+def public(apps):
+    """Inventory without the internal per-process lists."""
+    out = []
+    for a in apps:
+        a = {k: v for k, v in a.items() if k != "procs"}
+        a["windowList"] = [{k: v for k, v in w.items() if k != "procs"} for w in a["windowList"]]
+        out.append(a)
+    return out
+
 
 def hypr_clients():
     code, out, _ = run(["hyprctl", "-j", "clients"], timeout=3)
@@ -398,7 +500,7 @@ def anon_of(pid):
     return total
 
 
-def app_processes(scopes, first):
+def app_processes(procs, first):
     """(memory, names) for an app. Memory is the sum of each process's
     private resident memory: cgroup memory.current is wrong right after a
     protect, because pages stay charged to the cgroup that allocated them.
@@ -406,13 +508,12 @@ def app_processes(scopes, first):
     picks single processes, so the name it would kill is often a child (a
     browser renderer, the program inside a terminal), not the window's own."""
     by_name, total = {}, 0
-    for cg in scopes:
-        for pid in cg_pids(cg)[:2000]:
-            name = comm_of(pid)
-            anon = anon_of(pid)
-            total += anon
-            if name:
-                by_name[name] = by_name.get(name, 0) + max(anon, rss_of(pid))
+    for pid, _ in procs[:2000]:
+        name = comm_of(pid)
+        anon = anon_of(pid)
+        total += anon
+        if name:
+            by_name[name] = by_name.get(name, 0) + max(anon, rss_of(pid))
     ordered = [first] + [n for n, _ in sorted(by_name.items(), key=lambda kv: -kv[1]) if n != first]
     return total, R.clean_comms(ordered)
 
@@ -466,7 +567,7 @@ def window_info(c, procs, manager, shared, kids=None):
         running.insert(0, top)
     cgs = [cg for _, cg in procs]
     return {
-        "address": str(c.get("address") or ""), "pid": pid,
+        "address": str(c.get("address") or ""), "pid": pid, "start": start_of(pid),
         "title": clean(c.get("title") or "", 80), "workspace": workspace_label(c),
         "running": clean(top, 15), "memBytes": mem,
         # earlyoom names for a window rule: what runs inside, not the terminal.
@@ -479,26 +580,29 @@ def window_info(c, procs, manager, shared, kids=None):
 def app_inventory(manager, kids=None):
     """One row per window class, each with its windows."""
     kids = process_children() if kids is None else kids
-    clients = [c for c in hypr_clients()
-               if R.CLASS_RE.match(str(c.get("class") or c.get("initialClass") or ""))
-               and isinstance(c.get("pid"), int) and c["pid"] > 1
-               and R.WINDOW_RE.match(str(c.get("address") or ""))]
+    clients = window_clients()
     per_pid = {}
     for c in clients:
         per_pid[c["pid"]] = per_pid.get(c["pid"], 0) + 1
+    window_pids = set(per_pid)
     rows = {}
     for c in clients:
         cls = str(c.get("class") or c.get("initialClass"))
         pid = c["pid"]
-        procs = subtree(pid, kids, manager)
+        procs = subtree(pid, kids, manager, stop=window_pids)
         if not procs:
             continue
         row = rows.get(cls)
         if row is None:
             row = rows[cls] = {"kind": "app", "key": cls, "name": app_name(cls), "comms": [],
-                               "scopes": [], "windows": 0, "windowList": []}
+                               "scopes": [], "windows": 0, "windowList": [], "procs": []}
         row["windows"] += 1
-        row["windowList"].append(window_info(c, procs, manager, per_pid[pid] > 1, kids))
+        info = window_info(c, procs, manager, per_pid[pid] > 1, kids)
+        info["procs"] = procs
+        row["windowList"].append(info)
+        for pc in procs:
+            if pc not in row["procs"]:
+                row["procs"].append(pc)
         comm = comm_of(pid)
         if comm and comm not in row["comms"]:
             row["comms"].append(comm)
@@ -508,10 +612,12 @@ def app_inventory(manager, kids=None):
     out = []
     for row in rows.values():
         swap = sum(cg_mem(cg)[1] for cg in row["scopes"])
-        mem, row["comms"] = app_processes(row["scopes"], row["comms"][0] if row["comms"] else "")
+        mem, row["comms"] = app_processes(row["procs"], row["comms"][0] if row["comms"] else "")
         row["memBytes"], row["swapBytes"] = mem, swap
-        row["exposed"] = [cg.rsplit("/", 1)[-1] for cg in row["scopes"] if movable(cg, manager)]
-        row["guarded"] = any(is_guarded(cg) for cg in row["scopes"]) and not row["exposed"]
+        # Exposed = this app's own processes still in app.slice. Never "every
+        # pid of a cgroup": a terminal and a GUI it started can share one.
+        row["exposed"] = sorted({cg.rsplit("/", 1)[-1] for _, cg in row["procs"] if movable(cg, manager)})[:16]
+        row["guarded"] = any(is_guarded(cg) for _, cg in row["procs"]) and not row["exposed"]
         row["scopes"] = row["scopes"][:16]
         row["windowList"].sort(key=lambda w: -w["memBytes"])
         out.append(row)
@@ -541,7 +647,7 @@ def service_inventory(manager):
         except OSError:
             continue
         for name in sorted(names):
-            if not name.endswith(".service") or not R.UNIT_RE.match(name):
+            if not name.endswith(".service") or not R.UNIT_RE.fullmatch(name):
                 continue
             cg = manager + "/" + slice_name + "/" + name
             pids = cg_pids(cg)
@@ -663,7 +769,7 @@ def earlyoom_limits(args):
 
 def earlyoom_state(rules, units):
     unit = units.get("earlyoom.service", {})
-    want = R.earlyoom_regex(rules)
+    mine = set(R.earlyoom_names(rules))
     args = []
     pid = unit.get("MainPID", "0")
     if pid.isdigit() and int(pid) > 0:
@@ -673,26 +779,31 @@ def earlyoom_state(rules, units):
         if a == "--ignore":
             running = args[i + 1]  # earlyoom keeps the last --ignore it parses
     active = unit.get("ActiveState") == "active"
-    linked = os.path.exists(earlyoom_dropin()) and units.get(SYNC_PATH_UNIT, {}).get("LoadState") == "loaded"
+    timer = units.get(SYNC_TIMER_UNIT, {})
+    old = units.get(OLD_PATH_UNIT, {})
+    linked = os.path.exists(earlyoom_dropin()) and (timer.get("LoadState") == "loaded" or old.get("LoadState") == "loaded")
     # The root helper keeps its own copy of rules.py. After a plugin update it
-    # may not know newer rule kinds (single windows) and silently skip them.
-    current = True
-    if linked:
+    # may not know newer rule kinds and silently skip them; a 0.1.x link also
+    # still uses the old file watcher.
+    current = timer.get("LoadState") == "loaded"
+    if linked and current:
         try:
-            with open(helper_rules(), "rb") as f1, open(os.path.join(HERE, "rules.py"), "rb") as f2:
-                current = f1.read(262144) == f2.read(262144)
+            current = read_small(helper_rules(), 262144) == read_small(os.path.join(HERE, "rules.py"), 262144)
         except OSError:
             current = False
     installed = unit.get("LoadState") == "loaded"
+    have = R.names_in_regex(running)
     return {"installed": installed, "active": active,
             "failed": unit.get("ActiveState") == "failed",
             "enabled": unit.get("UnitFileState") in ("enabled", "enabled-runtime", "static", "indirect", "alias"),
             "since": since_of(unit) if active else 0,
             "package": package_info("earlyoom") if installed else None,
             "limits": earlyoom_limits(args) if active else None,
-            "linked": linked, "helperCurrent": current, "syncWatching": units.get(SYNC_PATH_UNIT, {}).get("ActiveState") == "active",
-            "applied": bool(linked and active and running == want),
-            "names": R.earlyoom_names(rules), "runningIgnore": clean(running, 400)}
+            "linked": linked, "helperCurrent": bool(current) if linked else True,
+            "syncWatching": timer.get("ActiveState") == "active" or old.get("ActiveState") == "active",
+            # Other users' names may be in the regex too: applied = all of mine are.
+            "applied": bool(linked and active and mine <= have),
+            "names": sorted(mine), "runningIgnore": clean(running, 400)}
 
 
 def meminfo():
@@ -766,7 +877,7 @@ def launcher_map(since):
     """scope unit -> what was launched in it, from uwsm's own journal lines."""
     out = {}
     for e in journal_json(["journalctl", "--no-pager", "-q", "-o", "json", "--since", since,
-                           "_UID=%d" % os.getuid(), "-t", "uwsm_app-daemon", "-g", "sent: exec"], 3000):
+                           "_UID=%d" % os.getuid(), "-t", "uwsm_app-daemon", "-g", "sent: exec"], 2000):
         msg = str(e.get("MESSAGE") or "")
         m = re.search(r"--unit=([^' ]+)", msg)
         if not m or " -- " not in msg:
@@ -806,85 +917,112 @@ def which(name):
 def op_status(req):
     manager = user_manager_cgroup()
     rules = load_rules()
-    kids = process_children()
-    apps = app_inventory(manager, kids)
-    units = systemctl_show(["systemd-oomd.service", "earlyoom.service", SYNC_PATH_UNIT],
+    apps = app_inventory(manager)
+    units = systemctl_show(["systemd-oomd.service", "earlyoom.service", SYNC_TIMER_UNIT, OLD_PATH_UNIT],
                            ["Id", "LoadState", "ActiveState", "UnitFileState", "MainPID", "ActiveEnterTimestamp"])
     remember_scopes(apps)
-    return {"ok": True, "rules": rules, "apps": apps, "services": service_inventory(manager),
+    return {"ok": True, "rules": rules, "apps": public(apps), "services": service_inventory(manager),
             "oomd": oomd_state(manager, units),
             "earlyoom": earlyoom_state(rules, units), "mem": meminfo(),
             "terminalAvailable": bool(which("omarchy-launch-floating-terminal-with-presentation"))}
 
 
-def window_procs(manager, kids, address, pid):
-    """The live process tree of one window, or None if that window is gone
-    (or its address now belongs to a different process)."""
-    for c in hypr_clients():
-        if str(c.get("address") or "") == address and c.get("pid") == pid:
-            return c, subtree(pid, kids, manager)
-    return None, None
+def rule_matches(rule, w):
+    return w["address"] == rule["key"] and w["pid"] == rule["pid"] and (not rule.get("start") or w["start"] == rule["start"])
 
 
-def move_window(manager, kids, rule):
-    """Move one window's processes out of app.slice. A process shared with
-    other windows (a foot server) is refused rather than moved: protecting
-    one window must never silently protect the others."""
-    c, procs = window_procs(manager, kids, rule["key"], rule["pid"])
-    if c is None:
-        return {"ok": False, "gone": True, "error": "window closed"}
-    if sum(1 for o in hypr_clients() if o.get("pid") == rule["pid"]) > 1:
-        return {"ok": False, "error": "this window shares its process with other windows; protect the app instead"}
-    exposed = [p for p, cg in procs if movable(cg, manager)]
-    if not exposed:
+def wanted_procs(rules, apps, only=None):
+    """(rule, [(pid, cgroup)]) for every running window a rule covers."""
+    out = []
+    for r in rules:
+        if only is not None and not (r["kind"] == only[0] and r["key"] == only[1]):
+            continue
+        if r["kind"] == "app":
+            row = next((a for a in apps if a["key"] == r["key"]), None)
+            if row:
+                out.append((r, row["procs"]))
+        elif r["kind"] == "window":
+            for a in apps:
+                for w in a["windowList"]:
+                    if rule_matches(r, w):
+                        out.append((r, w["procs"]))
+    return out
+
+
+def window_alive(rule, apps):
+    return any(rule_matches(rule, w) for a in apps for w in a["windowList"])
+
+
+def move_set(procs, dest, label, manager):
+    """Move these processes of the user's own apps, re-reading them right
+    before each step. Only transient app scopes are ever moved; a service's
+    processes never leave their service."""
+    if dest == GUARD_SLICE:
+        pick = lambda cg: movable(cg, manager)  # noqa: E731
+    else:
+        pick = lambda cg: cg.startswith(manager + "/" + GUARD_SLICE + "/") and cg.endswith(".scope")  # noqa: E731
+    ids = [(p, st) for p, st in ident(procs) if st and pick(pid_cgroup(p))]
+    if not ids:
         return {"ok": True, "moved": 0}
-    wanted = set(exposed)
+    pids = {p for p, _ in ids}
 
     def leftovers():
-        _, now = window_procs(manager, process_children(), rule["key"], rule["pid"])
-        return [p for p, cg in (now or []) if movable(cg, manager)]
+        kids = process_children()
+        more = []
+        for p in list(pids):
+            for c in kids.get(p, []):
+                if c not in pids and pick(pid_cgroup(c)):
+                    more.append((c, start_of(c)))
+        return more
 
-    return move_pids(sorted(wanted), GUARD_SLICE, rule["name"], leftovers)
+    return move_pids(ids, dest, label, leftovers)
 
 
 def apply_rules(rules, manager, only=None):
-    """Move every running window of a protected app, and every protected
-    single window, out of app.slice. Rules for windows that closed are
-    dropped from the list."""
+    """Move every running window a rule covers out of app.slice. Rules for
+    single windows that closed are dropped from the list."""
     moved, errors = [], []
-    kids = process_children()
-    apps = app_inventory(manager, kids)
-    wanted = {r["key"] for r in rules if r["kind"] == "app" and (only is None or r["key"] == only)}
-    for row in apps:
-        if row["key"] not in wanted:
-            continue
-        for cg in row["scopes"]:
-            if not movable(cg, manager):
-                continue
-            res = move_cgroup(cg, GUARD_SLICE, row["name"])
-            (moved if res.get("ok") else errors).append(dict(res, key=row["key"], name=row["name"]))
-    gone = []
-    for r in rules:
-        if r["kind"] != "window" or (only is not None and r["key"] != only):
-            continue
-        res = move_window(manager, kids, r)
-        if res.get("gone"):
-            gone.append(r["key"])
-        elif res.get("ok"):
-            if res.get("moved"):
-                moved.append(dict(res, key=r["key"], name=r["name"]))
-        else:
+    apps = app_inventory(manager)
+    for r, procs in wanted_procs(rules, apps, only):
+        res = move_set(procs, GUARD_SLICE, r["name"], manager)
+        if not res.get("ok"):
             errors.append(dict(res, key=r["key"], name=r["name"]))
-    if gone and only is None:
-        save_rules([r for r in load_rules() if not (r["kind"] == "window" and r["key"] in gone)])
+        elif res.get("moved"):
+            moved.append(dict(res, key=r["key"], name=r["name"]))
+    if only is None:
+        gone = [r for r in rules if r["kind"] == "window" and not window_alive(r, apps)]
+        live = refreshed_comms(rules, apps)
+        if gone or live != rules:
+            keep = {(g["kind"], g["key"]) for g in gone}
+            save_rules([r for r in live if (r["kind"], r["key"]) not in keep])
     if moved:
         apps = app_inventory(manager)
     return moved, errors, apps
 
 
+def refreshed_comms(rules, apps):
+    """Rules with earlyoom names taken from what runs now, so a terminal that
+    started another program, or an app with a new helper process, stays
+    covered. Names only change while the app or window is open."""
+    out = []
+    for r in rules:
+        live = None
+        if r["kind"] == "app":
+            row = next((a for a in apps if a["key"] == r["key"]), None)
+            live = row["comms"] if row else None
+        elif r["kind"] == "window":
+            w = next((w for a in apps for w in a["windowList"] if rule_matches(r, w)), None)
+            live = w["comms"] if w else None
+        if live and live != r["comms"]:
+            r = dict(r, comms=R.clean_comms(live))
+        out.append(r)
+    return out
+
+
 def op_apply(req):
     manager = user_manager_cgroup()
-    moved, errors, apps = apply_rules(load_rules(), manager)
+    with mutation_lock():
+        moved, errors, apps = apply_rules(load_rules(), manager)
     if apps:
         remember_scopes(apps)
     return {"ok": True, "moved": moved, "errors": errors}
@@ -895,12 +1033,12 @@ def op_protect(req):
     key = str(req.get("key") or "")
     manager = user_manager_cgroup()
     if kind == "app":
-        if not R.CLASS_RE.match(key):
+        if not R.CLASS_RE.fullmatch(key):
             return {"ok": False, "error": "invalid app"}
         row = next((a for a in app_inventory(manager) if a["key"] == key), None)
         name, comms = (row["name"], row["comms"]) if row else (app_name(key), [])
     elif kind == "window":
-        if not R.WINDOW_RE.match(key):
+        if not R.WINDOW_RE.fullmatch(key):
             return {"ok": False, "error": "invalid window"}
         win = None
         for row in app_inventory(manager):
@@ -909,12 +1047,16 @@ def op_protect(req):
                     win, app = w, row
         if win is None:
             return {"ok": False, "error": "that window is closed"}
+        # The panel sends the identity it showed; a window that closed and was
+        # replaced at the same address in between is refused, not protected.
+        if req.get("pid") != win["pid"] or req.get("start") != win["start"]:
+            return {"ok": False, "error": "that window changed; try again"}
         if win["shared"]:
             return {"ok": False, "error": "this window shares its process with other windows; protect the app instead"}
         label = win["running"] or (win["title"][:30] if win["title"] else "window")
         name, comms = "%s · %s" % (app["name"], label), win["comms"]
     elif kind == "service":
-        if not R.UNIT_RE.match(key):
+        if not R.UNIT_RE.fullmatch(key):
             return {"ok": False, "error": "invalid service"}
         if dropin_state(key) == "foreign":
             return {"ok": False, "error": "%s already has a %s that OOM Guard did not write" % (key, DROPIN_NAME)}
@@ -922,26 +1064,30 @@ def op_protect(req):
         name, comms = key[:-8], (row["comms"] if row else [])
     else:
         return {"ok": False, "error": "invalid kind"}
-    rules = [r for r in load_rules() if not (r["kind"] == kind and r["key"] == key)]
-    if len(rules) >= R.MAX_RULES:
-        return {"ok": False, "error": "too many protected entries (max %d)" % R.MAX_RULES}
-    rule = {"kind": kind, "key": key, "name": name, "comms": comms}
-    if kind == "window":
-        rule["pid"] = win["pid"]
-    rules.append(R.normalize_rule(rule))
-    save_rules(rules)
-    result = {"ok": True, "kind": kind, "key": key, "name": name}
-    if kind in ("app", "window"):
-        moved, errors, _ = apply_rules(rules, manager, only=key)
+    with mutation_lock():
+        rules = [r for r in load_rules() if not (r["kind"] == kind and r["key"] == key)]
+        if len(rules) >= R.MAX_RULES:
+            return {"ok": False, "error": "too many protected entries (max %d)" % R.MAX_RULES}
+        rule = {"kind": kind, "key": key, "name": name, "comms": comms}
+        if kind == "window":
+            rule["pid"], rule["start"] = win["pid"], win["start"]
+        rules.append(R.normalize_rule(rule))
+        result = {"ok": True, "kind": kind, "key": key, "name": name, "errors": []}
+        if kind == "service":
+            atomic_write(dropin_path(key), DROPIN_MARKER + "\n"
+                         "# Runs this service outside app.slice, the slice systemd-oomd watches.\n"
+                         "# Takes effect the next time the service starts.\n"
+                         "[Service]\nSlice=" + GUARD_SLICE + "\n", 0o644)
+            code, _, err = run(["systemctl", "--user", "daemon-reload"], timeout=15)
+            if code != 0:
+                os.unlink(dropin_path(key))
+                return {"ok": False, "error": clean("systemd did not reload: " + (err or str(code)), 160)}
+            save_rules(rules)
+            result["restartNeeded"] = True
+            return result
+        save_rules(rules)
+        moved, errors, _ = apply_rules(rules, manager, only=(kind, key))
         result.update(moved=moved, errors=errors)
-    else:
-        atomic_write(dropin_path(key), DROPIN_MARKER + "\n"
-                     "# Runs this service outside app.slice, the slice systemd-oomd watches.\n"
-                     "# Takes effect the next time the service starts.\n"
-                     "[Service]\nSlice=" + GUARD_SLICE + "\n", 0o644)
-        code, _, err = run(["systemctl", "--user", "daemon-reload"], timeout=15)
-        result["reloaded"] = code == 0
-        result["restartNeeded"] = True
     return result
 
 
@@ -950,42 +1096,44 @@ def op_unprotect(req):
     key = str(req.get("key") or "")
     if kind not in ("app", "service", "window"):
         return {"ok": False, "error": "invalid kind"}
-    if kind == "service" and not R.UNIT_RE.match(key):
+    if kind == "service" and not R.UNIT_RE.fullmatch(key):
         return {"ok": False, "error": "invalid service"}
-    before = load_rules()
-    save_rules([r for r in before if not (r["kind"] == kind and r["key"] == key)])
     manager = user_manager_cgroup()
-    result = {"ok": True, "kind": kind, "key": key}
-    if kind == "window":
-        old = next((r for r in before if r["kind"] == "window" and r["key"] == key), None)
-        if old:
-            _, procs = window_procs(manager, process_children(), key, old["pid"])
-            pids = [p for p, cg in (procs or []) if is_guarded(cg)]
-            if pids:
-                result["returned"] = [move_pids(pids, RETURN_SLICE, old["name"], lambda: [])]
-        return result
-    if kind == "app":
-        returned = []
-        for row in app_inventory(manager):
-            if row["key"] == key:
-                for cg in row["scopes"]:
-                    if is_guarded(cg) and cg.endswith(".scope"):
-                        returned.append(move_cgroup(cg, RETURN_SLICE, row["name"]))
-        result["returned"] = returned
-    elif dropin_state(key) == "ours":
-        os.unlink(dropin_path(key))
-        try:
-            os.rmdir(os.path.dirname(dropin_path(key)))
-        except OSError:
-            pass
-        run(["systemctl", "--user", "daemon-reload"], timeout=15)
-        result["restartNeeded"] = True
+    with mutation_lock():
+        before = load_rules()
+        target = next((r for r in before if r["kind"] == kind and r["key"] == key), None)
+        rest = [r for r in before if r is not target]
+        result = {"ok": True, "kind": kind, "key": key, "errors": []}
+        if kind == "service":
+            if dropin_state(key) == "ours":
+                os.unlink(dropin_path(key))
+                try:
+                    os.rmdir(os.path.dirname(dropin_path(key)))
+                except OSError:
+                    pass
+                code, _, err = run(["systemctl", "--user", "daemon-reload"], timeout=15)
+                if code != 0:
+                    result["errors"].append({"error": clean("systemd did not reload: " + (err or str(code)), 160)})
+                result["restartNeeded"] = True
+            save_rules(rest)
+            return result
+        save_rules(rest)
+        if target is None:
+            return result
+        apps = app_inventory(manager)
+        # Processes another remaining rule still covers stay protected.
+        still = {p for _, procs in wanted_procs(rest, apps) for p, _ in procs}
+        for _, procs in wanted_procs([target], apps):
+            back = [pc for pc in procs if pc[0] not in still]
+            res = move_set(back, RETURN_SLICE, target["name"], manager)
+            if not res.get("ok"):
+                result["errors"].append(dict(res, key=key, name=target["name"]))
     return result
 
 
 def op_restart_service(req):
     key = str(req.get("key") or "")
-    if not R.UNIT_RE.match(key):
+    if not R.UNIT_RE.fullmatch(key):
         return {"ok": False, "error": "invalid service"}
     if not any(s["key"] == key for s in service_inventory(user_manager_cgroup())):
         return {"ok": False, "error": "not a running user service"}
@@ -996,9 +1144,13 @@ def op_restart_service(req):
 
 
 def journal_json(argv, limit):
-    _, out, _ = run(argv, timeout=10, cap=4 * 1024 * 1024)
+    """Newest `limit` matching entries, newest first. journalctl itself stops
+    after `limit` records (-n with -r), and only the needed fields come back,
+    so the read is small however large the journal is."""
+    _, out, _ = run(argv + ["-r", "-n", str(int(limit)), "--output-fields=MESSAGE,USER_UNIT,UNIT,__REALTIME_TIMESTAMP"],
+                    timeout=10, cap=2 * 1024 * 1024)
     rows = []
-    for line in out.splitlines()[-limit:]:
+    for line in out.splitlines():
         try:
             e = json.loads(line)
         except ValueError:
@@ -1018,14 +1170,14 @@ def op_kills(req):
     launched = launcher_map(since)
     kills = []
     for e in journal_json(["journalctl", "--no-pager", "-q", "-o", "json", "--since", since,
-                           "_UID=%d" % os.getuid(), "_COMM=systemd", "-g", "systemd-oomd killed"], 200):
+                           "_UID=%d" % os.getuid(), "_COMM=systemd", "-g", "systemd-oomd killed"], 500):
         unit = str(e.get("USER_UNIT") or e.get("UNIT") or "")
         m = re.search(r"killed (\d+) process", str(e.get("MESSAGE") or ""))
         kills.append({"by": "systemd-oomd", "name": scope_label(unit, known, launched), "unit": clean(unit, 120),
                       "processes": int(m.group(1)) if m else None,
                       "t": int(e.get("__REALTIME_TIMESTAMP") or 0) // 1000000})
     for e in journal_json(["journalctl", "--no-pager", "-q", "-o", "json", "--since", since,
-                           "-u", "earlyoom.service", "-g", "sending SIG(TERM|KILL) to process"], 400):
+                           "-u", "earlyoom.service", "-g", "sending SIG(TERM|KILL) to process"], 500):
         m = re.search(r'sending (SIG\w+) to process \d+ uid (\d+) "([^"]*)".*?VmRSS (\d+) MiB', str(e.get("MESSAGE") or ""))
         if not m or int(m.group(2)) != os.getuid():
             continue
@@ -1038,13 +1190,16 @@ def op_kills(req):
     for k in kills:
         counts[k["by"]] += 1
         last[k["by"]] = max(last[k["by"]], k["t"])
-    return {"ok": True, "days": days, "total": len(kills), "counts": counts, "last": last, "kills": kills[:60]}
+    # Counts cover the newest 500 records of each killer; more is reported as "500+".
+    capped = {"systemd-oomd": counts["systemd-oomd"] >= 500, "earlyoom": counts["earlyoom"] >= 500}
+    return {"ok": True, "days": days, "total": len(kills), "counts": counts, "capped": capped,
+            "last": last, "kills": kills[:60]}
 
 
 def op_focus(req):
     """Bring one window to the front so the user can see which one a row is."""
     address = str(req.get("address") or "")
-    if not R.WINDOW_RE.match(address):
+    if not R.WINDOW_RE.fullmatch(address):
         return {"ok": False, "error": "invalid window"}
     if not any(str(c.get("address") or "") == address for c in hypr_clients()):
         return {"ok": False, "error": "that window is closed"}
@@ -1060,6 +1215,8 @@ OPS = {"status": op_status, "kills": op_kills, "protect": op_protect, "unprotect
 
 
 def main():
+    signal.signal(signal.SIGALRM, lambda *_: os._exit(124))
+    signal.alarm(DEADLINE_S)
     raw = sys.stdin.buffer.read(MAX_REQUEST + 1)
     try:
         if len(raw) > MAX_REQUEST:

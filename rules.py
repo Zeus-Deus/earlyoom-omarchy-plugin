@@ -1,3 +1,4 @@
+# Managed by OOM Guard (io.github.zeus-deus.oomguard).
 """The protected list: one parser and one earlyoom regex builder.
 
 Shared by bridge.py (runs as the desktop user inside the shell) and by
@@ -8,18 +9,25 @@ root side build the same string. Pure stdlib, no I/O beyond what callers pass.
 import json
 import re
 
+MARKER = "# Managed by OOM Guard (io.github.zeus-deus.oomguard)."
 MAX_RULES = 64
 MAX_COMMS = 4
+# Per user. The root helper unions users' names without truncating, so one
+# user can never push another user's names out.
 MAX_IGNORE_NAMES = 32
 # earlyoom matches /proc/<pid>/comm, which the kernel truncates to 15 bytes.
 # The class is deliberately narrow: no whitespace, quotes, backslashes or
 # regex syntax, so the generated value survives a systemd EnvironmentFile and
 # an unbraced $VAR expansion as exactly one word.
-COMM_RE = re.compile(r"^[A-Za-z0-9._+-]{1,15}$")
-UNIT_RE = re.compile(r"^[A-Za-z0-9:_.\\@-]{1,200}\.service$")
-CLASS_RE = re.compile(r"^[^\x00-\x1f\x7f/]{1,128}$")
+# Every pattern is used with fullmatch(): "$" alone also matches before a
+# trailing newline.
+COMM_RE = re.compile(r"[A-Za-z0-9._+-]{1,15}")
+UNIT_RE = re.compile(r"[A-Za-z0-9:_.\\@-]{1,200}\.service")
+CLASS_RE = re.compile(r"[^\x00-\x1f\x7f/]{1,128}")
 # A Hyprland window address. A window rule lives only as long as the window.
-WINDOW_RE = re.compile(r"^0x[0-9a-f]{1,16}$")
+WINDOW_RE = re.compile(r"0x[0-9a-f]{1,16}")
+# Versioned interpreters (python3.13, perl5.40, node22): same reason as below.
+INTERPRETER_RE = re.compile(r"(python|perl|ruby|node|php|lua|luajit|tclsh|wish|java|pypy|bash|zsh|ksh|sh)[0-9.]*")
 # Interpreters, shells and launchers: ignoring one of these would protect
 # every script on the machine, not the app the user picked.
 # The desktop session itself. earlyoom's stock --avoid covers only init,
@@ -42,11 +50,16 @@ def clean_text(value, limit=80):
     return text[:limit]
 
 
+def ok_comm(c):
+    return (isinstance(c, str) and COMM_RE.fullmatch(c) is not None and c not in GENERIC_COMMS
+            and INTERPRETER_RE.fullmatch(c) is None)
+
+
 def clean_comms(values):
     out = []
     for c in values or []:
         c = str(c or "")
-        if COMM_RE.match(c) and c not in GENERIC_COMMS and c not in out:
+        if ok_comm(c) and c not in out:
             out.append(c)
         if len(out) >= MAX_COMMS:
             break
@@ -59,13 +72,13 @@ def normalize_rule(item):
     kind = item.get("kind")
     key = str(item.get("key") or "")
     if kind == "app":
-        if not CLASS_RE.match(key):
+        if not CLASS_RE.fullmatch(key):
             return None
     elif kind == "service":
-        if not UNIT_RE.match(key):
+        if not UNIT_RE.fullmatch(key):
             return None
     elif kind == "window":
-        if not WINDOW_RE.match(key):
+        if not WINDOW_RE.fullmatch(key):
             return None
     else:
         return None
@@ -77,10 +90,15 @@ def normalize_rule(item):
     if kind == "window":
         # Window addresses are reused after a window closes; the pid pins the
         # rule to the one window it was made for.
-        pid = item.get("pid")
+        pid, start = item.get("pid"), item.get("start", 0)
         if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
             return None
+        if not isinstance(start, int) or isinstance(start, bool) or start < 0:
+            return None
         rule["pid"] = pid
+        # The process start time (clock ticks since boot) tells a reused pid
+        # apart from the process the rule was made for.
+        rule["start"] = start
     return rule
 
 
@@ -88,7 +106,8 @@ def parse_rules(raw):
     """Parse protected.json text; anything malformed yields an empty list."""
     try:
         data = json.loads(raw)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
+        # RecursionError: a few KB of nested brackets is enough to raise it.
         return []
     items = data.get("protected") if isinstance(data, dict) else None
     out = []
@@ -109,16 +128,27 @@ def earlyoom_names(rules):
     names = set()
     for r in rules:
         for c in r.get("comms") or []:
-            if COMM_RE.match(c) and c not in GENERIC_COMMS:
+            if ok_comm(c):
                 names.add(c)
     return sorted(names)[:MAX_IGNORE_NAMES]
 
 
-def earlyoom_regex(rules):
+def regex_for_names(names):
     """The value earlyoom gets after --ignore: the desktop session plus the
-    user's protected names.
+    given names.
 
     Anchored on the whole comm. "." and "+" go in brackets so the regex needs
     no backslash (systemd unescapes those in EnvironmentFile values)."""
-    names = sorted(set(earlyoom_names(rules)) | set(SESSION_COMMS))
+    names = sorted({n for n in names if ok_comm(n)} | set(SESSION_COMMS))
     return "^(" + "|".join(n.replace(".", "[.]").replace("+", "[+]") for n in names) + ")$"
+
+
+def earlyoom_regex(rules):
+    return regex_for_names(earlyoom_names(rules))
+
+
+def names_in_regex(regex):
+    """Inverse of regex_for_names, for checking what a running earlyoom has."""
+    if not (isinstance(regex, str) and regex.startswith("^(") and regex.endswith(")$")):
+        return set()
+    return {n.replace("[.]", ".").replace("[+]", "+") for n in regex[2:-2].split("|") if n}

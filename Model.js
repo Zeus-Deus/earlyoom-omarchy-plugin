@@ -72,7 +72,9 @@ function appRows(status, expanded) {
     var rules = s.rules || [];
     var open = expanded || {};
     var rows = [];
-    var seen = {};
+    // Window classes are external strings: "constructor" or "__proto__" must
+    // not hit Object.prototype.
+    var seen = Object.create(null);
     var ordered = [];
     for (var i = 0; i < rules.length; i++) {
         var r = rules[i];
@@ -98,7 +100,8 @@ function appRows(status, expanded) {
         else { sub = windowsLabel(a.windows); state = "open"; }
         var key = rule ? rule.key : a.key;
         var showWindows = !rule && wins.length > 0 && (wins.length > 1 || !!wins[0].running);
-        var isOpen = showWindows && (open[key] === true || winProtected > 0 || (open[key] !== false && wins.length <= 3));
+        var flag = Object.prototype.hasOwnProperty.call(open, key) ? open[key] : undefined;
+        var isOpen = showWindows && (flag === true || winProtected > 0 || (flag !== false && wins.length <= 3));
         rows.push({kind: "app", key: key, name: sanitize(a ? a.name : rule.name, 48), protected: !!rule, running: !!a,
                    memBytes: a ? a.memBytes : 0, sub: sub, state: state,
                    expandable: showWindows, expanded: isOpen});
@@ -111,7 +114,7 @@ function appRows(status, expanded) {
             if (win.running && win.title) parts.push(sanitize(win.title, 40));
             var guarded = !!wr && win.guarded;
             rows.push({kind: "window", key: win.address, app: key, name: label, protected: !!wr, running: true,
-                       memBytes: win.memBytes, shared: !!win.shared,
+                       memBytes: win.memBytes, shared: !!win.shared, pid: win.pid, start: win.start,
                        sub: win.shared ? parts[0] + " · shares a process · protect the app"
                           : (wr ? (guarded ? "Protected · " : "Protecting… · ") : "") + parts.join(" · "),
                        state: win.shared ? "shared" : (wr ? (guarded ? "guarded" : "pending") : "open")});
@@ -203,9 +206,10 @@ function sinceDate(t) {
 // The two killer cards on the Killers tab. Each card: who it is, whether it
 // runs, when it acts, what it kills, its kills in the window, and which
 // action the panel offers for it.
-function killsLine(n, days, last, now) {
+function killsLine(n, days, last, now, capped) {
     var c = Number(n) || 0;
-    return (c === 1 ? "1 kill" : c + " kills") + " in " + days + " days" + (last ? " · last " + ago(last, now) : "");
+    var count = capped ? c + "+ kills" : (c === 1 ? "1 kill" : c + " kills");
+    return count + " in " + days + " days" + (last ? " · last " + ago(last, now) : "");
 }
 
 function killerCards(status, killsResult, now) {
@@ -214,6 +218,7 @@ function killerCards(status, killsResult, now) {
     var e = s.earlyoom || {};
     var counts = (killsResult && killsResult.counts) || {};
     var last = (killsResult && killsResult.last) || {};
+    var capped = (killsResult && killsResult.capped) || {};
     var days = (killsResult && killsResult.days) || 30;
     var cards = [];
     var swap = o.swapLimit === null || o.swapLimit === undefined ? 90 : o.swapLimit;
@@ -222,12 +227,12 @@ function killerCards(status, killsResult, now) {
         state: o.active ? "Running" : (o.enabled ? "Stopped" : "Off"), active: !!o.active,
         when: "Swap over " + percent(swap) + ", or memory stalled for 20 s",
         what: "Closes a whole app · never Hyprland or the bar",
-        kills: killsLine(counts["systemd-oomd"], days, last["systemd-oomd"], now),
+        kills: killsLine(counts["systemd-oomd"], days, last["systemd-oomd"], now, capped["systemd-oomd"]),
         note: o.byOmarchy ? "Turned on by Omarchy" : "",
         action: "", actionLabel: "", secondary: "", secondaryLabel: ""
     });
     var lim = e.limits || {memPercent: 10, swapPercent: 10};
-    var stale = !!(e.linked && e.helperCurrent === false);
+    var stale = !!(e.linked && (e.helperCurrent === false || e.syncWatching === false));
     var needsLink = !!(e.installed && e.active && (!e.linked || stale));
     var state, action = "", actionLabel = "", secondary = "", secondaryLabel = "";
     if (!e.installed) { state = "Not installed"; action = "install"; actionLabel = "Install…"; }
@@ -250,7 +255,7 @@ function killerCards(status, killsResult, now) {
               : (lim.absolute ? "Fixed memory and swap sizes"
               : "Free memory under " + percent(lim.memPercent) + " and free swap under " + percent(lim.swapPercent)),
         what: "Kills the biggest process · works on servers too",
-        kills: e.installed ? killsLine(counts.earlyoom, days, last.earlyoom, now) : "",
+        kills: e.installed ? killsLine(counts.earlyoom, days, last.earlyoom, now, capped.earlyoom) : "",
         note: note.join(" · "), action: action, actionLabel: actionLabel,
         secondary: secondary, secondaryLabel: secondaryLabel, linked: !!e.linked
     });
@@ -310,7 +315,9 @@ function killerNotice(status) {
     if (eo.active && !eo.linked && (eo.names || []).length > 0)
         return {text: "earlyoom is running and does not know this list yet.", level: "warn", action: "link"};
     if (eo.active && eo.linked && eo.helperCurrent === false)
-        return {text: "earlyoom's link is from an older OOM Guard. Relink to include windows.", level: "warn", action: "link", label: "Relink…"};
+        return {text: "earlyoom's link is from an older OOM Guard. Relink to update it.", level: "warn", action: "link", label: "Relink…"};
+    if (eo.active && eo.linked && eo.syncWatching === false)
+        return {text: "The earlyoom link is not running, so list changes do not reach earlyoom.", level: "warn", action: "link", label: "Relink…"};
     if (eo.active && eo.linked && !eo.applied)
         return {text: "Updating earlyoom…", level: "ok", action: ""};
     var parts = [];
@@ -388,7 +395,7 @@ function wheelContentY(contentY, contentHeight, height, pixelDeltaY, angleDeltaY
 
 // Hyprland events that may have created a window of a protected app.
 function isWindowEvent(name) {
-    return name === "openwindow" || name === "openwindowv2";
+    return name === "openwindow" || name === "openwindowv2" || name === "closewindow";
 }
 
 function hasAppRules(status) {

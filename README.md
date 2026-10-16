@@ -35,7 +35,9 @@ Click the shield in the bar, then switch on what you want to keep.
 
 They work fine together, and OOM Guard keeps one list for both. Protecting
 from systemd-oomd needs no password. For earlyoom, press **Link…** once and
-type your password in the terminal that opens.
+type your password in the terminal that opens. earlyoom is one service for
+the whole machine, so on a computer with several accounts, every account's
+list applies to everyone ([details](docs/DEVELOPMENT.md#security-details)).
 
 ## Keys
 
@@ -65,8 +67,9 @@ sudo bash ~/.config/omarchy/plugins/io.github.zeus-deus.oomguard/helper/uninstal
 omarchy plugin remove io.github.zeus-deus.oomguard --yes
 ```
 
-Your list stays in `~/.config/oomguard/`. Switch services off before removing,
-or delete `~/.config/systemd/user/*.service.d/50-oomguard.conf`.
+Your list stays in `~/.config/oomguard/`. Switch services off in the panel
+before removing; that deletes the `50-oomguard.conf` drop-ins OOM Guard wrote
+and nothing else.
 
 ## License
 

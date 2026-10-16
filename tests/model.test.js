@@ -237,3 +237,26 @@ test('the only root path is a fixed command in a visible terminal', () => {
 test('no agent-instruction file ships at the repository root', () => {
   for (const f of ['AGENTS.md', 'CLAUDE.md', 'GEMINI.md']) assert.equal(fs.existsSync(path.join(root, f)), false, f);
 });
+
+test('window classes named like Object members still show up', () => {
+  const apps = ['constructor', 'toString', '__proto__'].map(k => ({key: k, name: k, memBytes: 1, windows: 1, exposed: [], windowList: []}));
+  const rows = Model.appRows({rules: [], apps}, {});
+  same(rows.map(r => r.key), ['constructor', 'toString', '__proto__']);
+});
+
+test('a stopped earlyoom link is reported and offers Relink', () => {
+  const status = {oomd: {}, earlyoom: {installed: true, active: true, linked: true, helperCurrent: true, syncWatching: false, applied: true}};
+  assert.equal(Model.killerNotice(status).label, 'Relink…');
+  assert.equal(Model.killerCards(status, null, 0)[1].actionLabel, 'Relink…');
+});
+
+test('kill counts at the read limit are shown as a lower bound', () => {
+  const card = Model.killerCards({oomd: {}, earlyoom: {installed: true}}, {days: 30, counts: {earlyoom: 500}, capped: {earlyoom: true}, last: {}}, 0)[1];
+  assert.match(card.kills, /^500\+ kills in 30 days/);
+});
+
+test('window rows carry the identity protect sends back', () => {
+  const rows = Model.appRows(JSON.parse(JSON.stringify(terminals)).apps ? Object.assign({}, terminals, {apps: terminals.apps.map(a => Object.assign({}, a, {windowList: a.windowList.map(w => Object.assign({start: 7}, w))}))}) : terminals);
+  const w = rows.find(r => r.kind === 'window');
+  same([w.pid, w.start], [50, 7]);
+});

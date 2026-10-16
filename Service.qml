@@ -67,7 +67,13 @@ Item {
 
     function refresh() { run({op: "status"}) }
     function loadKills() { run({op: "kills", days: 30}) }
-    function protect(kind, key) { run({op: "protect", kind: kind, key: key}) }
+    // A window carries the pid and start time the panel showed, so the bridge
+    // refuses if the address now belongs to a different window.
+    function protect(kind, key, pid, start) {
+        var req = {op: "protect", kind: kind, key: key};
+        if (kind === "window") { req.pid = pid; req.start = start; }
+        run(req);
+    }
     function unprotect(kind, key) { run({op: "unprotect", kind: kind, key: key}) }
     function restartService(key) { run({op: "restart_service", key: key}) }
     function applyNow() { run({op: "apply"}) }
@@ -113,6 +119,9 @@ Item {
         onTriggered: {
             if (!root.busy) return;
             root.timedOut = true;
+            // Only the wrapper gets the signal. The bridge ends itself at its
+            // own hard deadline (bridge.py, DEADLINE_S), and its lock keeps a
+            // late bridge from overlapping the next request's changes.
             if (worker.running) worker.signal(9);
             else root.finishWorker(-1);
         }
@@ -147,6 +156,19 @@ Item {
                 applyDebounce.restart();
                 return;
             }
+            var wins = apps[i].windowList || [];
+            for (var j = 0; j < wins.length; j++)
+                if (!wins[j].guarded && Model.ruleFor(status.rules, "window", wins[j].address)) { applyDebounce.restart(); return; }
+        }
+        // A window rule whose window is gone: apply drops it from the list.
+        var rules = status.rules || [];
+        for (var k = 0; k < rules.length; k++) {
+            if (rules[k].kind !== "window") continue;
+            var alive = false;
+            for (var a = 0; a < apps.length && !alive; a++)
+                for (var w = 0; w < (apps[a].windowList || []).length; w++)
+                    if (apps[a].windowList[w].address === rules[k].key) { alive = true; break; }
+            if (!alive) { applyDebounce.restart(); return; }
         }
     }
 }

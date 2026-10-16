@@ -1,82 +1,164 @@
-#!/usr/bin/python3 -I
+#!/usr/bin/python3 -IB
+# Managed by OOM Guard (io.github.zeus-deus.oomguard).
 """Root side of OOM Guard: turn users' protected lists into earlyoom's --ignore.
 
-Started by oomguard-earlyoom-sync.path whenever a user's
-~/.config/oomguard/protected.json changes. It reads every human user's list
-(bounded, regular files only, never following symlinks), builds one anchored
-process-name regex with the same code the panel uses (rules.py), writes it to
-/etc/oomguard/earlyoom.env and, only when the value changed, restarts
-earlyoom so it takes effect. Names are limited to [A-Za-z0-9._+-]{1,15} and
-interpreters such as python or bash are refused, so nobody can ignore every
-script on the machine through this file.
+Started every 15 s by oomguard-earlyoom-sync.timer, never by a user's file
+event, so no user can exhaust a start limit or restart earlyoom at will. It
+reads each human user's ~/.config/oomguard/protected.json, walking the path
+one descriptor at a time without following symlinks and accepting only
+directories and a regular file owned by that user. Each user contributes at
+most rules.MAX_IGNORE_NAMES names; a broken or hostile list contributes none
+and never affects anyone else's names. Names are limited to
+[A-Za-z0-9._+-]{1,15} and interpreters (python3.13, bash, ...) are refused.
 
-A user's list can only make earlyoom skip process names; it cannot stop
-earlyoom, change thresholds or add other options.
+The result goes to /etc/oomguard/earlyoom.env. earlyoom is restarted only
+when the running process does not already have exactly that --ignore, and at
+most once a minute. If the administrator gave earlyoom an --ignore of their
+own in /etc/default/earlyoom, OOM Guard yields: it writes an empty value and
+never overrides theirs.
+
+A list can only make earlyoom skip process names. It cannot stop earlyoom,
+change thresholds or add other options.
 """
 import os
 import pwd
 import stat
 import subprocess
 import sys
+import time
 
 LIB = "/usr/lib/oomguard"
 sys.path.insert(0, LIB)
 import rules as R  # noqa: E402
 
 ENV_FILE = "/etc/oomguard/earlyoom.env"
+ADMIN_ENV = "/etc/default/earlyoom"
+STAMP = "/run/oomguard/last-restart"
 MAX_BYTES = 64 * 1024
+MIN_RESTART_GAP = 60
+FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
 
 
-def read_list(home):
-    path = os.path.join(home, ".config", "oomguard", "protected.json")
+def read_list(pw):
+    """The user's list, or [] for anything unexpected. Each component below
+    the home directory is opened relative to its parent without following
+    symlinks, and every one of them must be owned by the user."""
+    fds = []
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
-    except OSError:
-        return []
-    try:
+        cur = os.open(pw.pw_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        fds.append(cur)
+        if os.fstat(cur).st_uid != pw.pw_uid:
+            return []
+        for part in (".config", "oomguard"):
+            cur = os.open(part, FLAGS | os.O_DIRECTORY, dir_fd=cur)
+            fds.append(cur)
+            if os.fstat(cur).st_uid != pw.pw_uid:
+                return []
+        fd = os.open("protected.json", FLAGS, dir_fd=cur)
+        fds.append(fd)
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_BYTES:
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != pw.pw_uid or st.st_size > MAX_BYTES:
             return []
         data = os.read(fd, MAX_BYTES + 1)
-    finally:
-        os.close(fd)
-    if len(data) > MAX_BYTES:
+        if len(data) > MAX_BYTES:
+            return []
+        return R.parse_rules(data.decode("utf-8", "replace"))
+    except (OSError, ValueError, RecursionError):
         return []
-    return R.parse_rules(data.decode("utf-8", "replace"))
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
 
 
-def human_homes():
+def human_users():
+    seen = set()
     for pw in pwd.getpwall():
-        if 1000 <= pw.pw_uid < 60000 and pw.pw_dir.startswith("/home/"):
-            yield pw.pw_dir
+        if 1000 <= pw.pw_uid < 60000 and pw.pw_dir.startswith("/home/") and pw.pw_uid not in seen:
+            seen.add(pw.pw_uid)
+            yield pw
+
+
+def admin_has_ignore():
+    """True when /etc/default/earlyoom already passes its own --ignore."""
+    try:
+        with open(ADMIN_ENV, encoding="utf-8", errors="replace") as f:
+            text = f.read(MAX_BYTES)
+    except OSError:
+        return False
+    return any("--ignore" in line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+
+def running_ignore():
+    """(running, value of the last --ignore earlyoom was started with)."""
+    p = subprocess.run(["systemctl", "show", "-p", "MainPID", "--value", "earlyoom.service"],
+                       capture_output=True, text=True, timeout=10, check=False)
+    pid = p.stdout.strip()
+    if not pid.isdigit() or pid == "0":
+        return False, ""
+    try:
+        with open("/proc/%s/cmdline" % pid, "rb") as f:
+            args = f.read(65536).decode("utf-8", "replace").split("\0")
+    except OSError:
+        return False, ""
+    value = ""
+    for i, a in enumerate(args[:-1]):
+        if a == "--ignore":
+            value = args[i + 1]  # earlyoom keeps the last one it parses
+    return True, value
+
+
+def write_env(text):
+    try:
+        with open(ENV_FILE, encoding="utf-8") as f:
+            if f.read(MAX_BYTES) == text:
+                return
+    except OSError:
+        pass
+    tmp = ENV_FILE + ".tmp"
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, ENV_FILE)
+
+
+def restart_allowed():
+    try:
+        return time.time() - os.stat(STAMP).st_mtime >= MIN_RESTART_GAP
+    except OSError:
+        return True
 
 
 def main():
-    rules = []
-    for home in sorted(set(human_homes())):
-        rules.extend(read_list(home))
-    regex = R.earlyoom_regex(rules)
-    # Value goes after `--ignore` in ExecStart; an empty value means no list.
-    line = "OOMGUARD_ARGS=%s\n" % ("--ignore " + regex if regex else "")
-    for ch in regex:
-        if not (ch.isalnum() or ch in "^$()|[]._+-"):
-            print("refusing unexpected character in regex", file=sys.stderr)
-            return 1
-    try:
-        with open(ENV_FILE, encoding="utf-8") as f:
-            old = f.read()
-    except OSError:
-        old = None
-    if old == line:
+    names = set()
+    for pw in human_users():
+        try:
+            names.update(R.earlyoom_names(read_list(pw)))  # at most MAX_IGNORE_NAMES per user
+        except Exception as exc:  # one user's list never stops the others
+            print("skipped uid %d: %s" % (pw.pw_uid, type(exc).__name__), file=sys.stderr)
+    yielded = admin_has_ignore()
+    regex = "" if yielded else R.regex_for_names(names)
+    # Every name passed R.ok_comm, so this never fires; it stays as a last
+    # guard on what reaches a root unit's command line.
+    if any(not (ch.isalnum() or ch in "^$()|[]._+-") for ch in regex):
+        print("refusing unexpected character in regex", file=sys.stderr)
+        return 1
+    write_env(R.MARKER + "\nOOMGUARD_ARGS=%s\n" % ("--ignore " + regex if regex else ""))
+    running, have = running_ignore()
+    if not running or have == regex or (yielded and have):
         return 0
-    os.makedirs(os.path.dirname(ENV_FILE), mode=0o755, exist_ok=True)
-    tmp = ENV_FILE + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(line)
-    os.replace(tmp, ENV_FILE)
-    names = ", ".join(R.earlyoom_names(rules)) or "none"
-    print("earlyoom protected process names: " + names)
+    if not restart_allowed():
+        return 0  # a later tick applies it
+    os.makedirs(os.path.dirname(STAMP), mode=0o755, exist_ok=True)
+    with open(STAMP, "w", encoding="utf-8") as f:
+        f.write("%d\n" % time.time())
+    if yielded:
+        print("earlyoom has its own --ignore in %s; OOM Guard leaves it alone" % ADMIN_ENV)
+    else:
+        print("earlyoom protected process names: " + (", ".join(sorted(names)) or "none"))
     # try-restart: only if earlyoom is running; never starts a stopped one.
     subprocess.run(["systemctl", "try-restart", "earlyoom.service"], check=False, timeout=30)
     return 0

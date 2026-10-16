@@ -1,0 +1,14 @@
+# Managed by OOM Guard (io.github.zeus-deus.oomguard).
+# A fixed schedule instead of watching users' files: no user can trigger the
+# sync (or an earlyoom restart) by touching their list, and nothing can push
+# it into systemd's start limit.
+[Unit]
+Description=Apply OOM Guard protected names to earlyoom every 15 s
+
+[Timer]
+OnBootSec=10s
+OnUnitInactiveSec=15s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

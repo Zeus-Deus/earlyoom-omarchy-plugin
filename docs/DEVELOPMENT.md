@@ -31,8 +31,9 @@ applies it to both.
 
 **earlyoom** picks single processes by name and score. The panel keeps your
 list in `~/.config/oomguard/protected.json`. The optional helper is a root
-systemd path unit that turns that list into earlyoom's `--ignore` option and
-restarts earlyoom when the list changes. It also always adds the desktop itself
+systemd timer (every 15 s) that turns the lists into earlyoom's `--ignore`
+option and restarts earlyoom, at most once a minute, only when the running
+earlyoom does not already have that value. It also always adds the desktop itself
 (Hyprland, the Omarchy shell and Xwayland). Without that, earlyoom's next
 choice after your protected apps is often the shell: in testing, it killed the
 bar eleven times in two minutes until Omarchy stopped restarting it.
@@ -61,11 +62,37 @@ bar eleven times in two minutes until Omarchy stopped restarting it.
   `sudo systemctl enable|disable --now earlyoom.service`,
   `omarchy pkg add|drop earlyoom`), and you type your own password there.
   None of those commands is built from window titles, settings or the list.
-- The root helper reads each user's list as a regular file, without following
-  symlinks, and with a size limit. It accepts only names made of
-  `A-Z a-z 0-9 . _ + -`, at most 15 characters each, and refuses interpreters
-  such as `python3` or `bash`. A list can only add names for earlyoom to skip.
-  It cannot stop earlyoom or change its other options.
+- **Linking earlyoom is a machine-wide decision.** earlyoom is one system
+  service, so the helper reads the list of every human account (UID 1000 to
+  59999 with a home under `/home`), and the names in it are skipped for every
+  user's processes, root's included. Only link it on a machine whose users you
+  trust with that. Each account adds at most 32 names, and one account can
+  never remove or replace another account's names.
+- The root helper opens `~/.config/oomguard/protected.json` one path component
+  at a time without following symlinks, requires every component to be owned
+  by that user, and reads at most 64 KiB of a regular file. A broken list,
+  including deeply nested JSON, counts as empty for that user only. It accepts
+  only names made of `A-Z a-z 0-9 . _ + -`, at most 15 characters each, and
+  refuses interpreters such as `python3.13` or `bash`. A list can only add names
+  for earlyoom to skip. It cannot stop earlyoom or change its other options.
+- The sync runs from a fixed timer, never from a user's file event, so no user
+  can restart earlyoom at will or push the sync into systemd's start limit.
+- `install.sh` only links the packaged earlyoom unit (`ExecStart=/usr/bin/earlyoom
+  $EARLYOOM_ARGS`, no other drop-in changing it), so every option in
+  `/etc/default/earlyoom` stays in effect. If that file already passes its own
+  `--ignore`, OOM Guard adds nothing and leaves the administrator's in charge.
+- Every root file the helper installs starts with the line
+  `# Managed by OOM Guard (io.github.zeus-deus.oomguard).` `install.sh` checks
+  all targets first and refuses to change anything if one exists without it;
+  `uninstall.sh` removes only files that carry it and reports the rest.
+- The bridge caps every child's output while reading it, and ends itself after
+  55 s. Changes are serialized with a lock, so a bridge the panel stopped
+  waiting for cannot overlap the next change.
+- Moves touch only the processes of the window or app you picked, never every
+  process of a shared cgroup, and only transient app scopes: a service's
+  processes never leave their service. A window is identified by address, pid
+  and process start time, so a reused address or pid is never protected by
+  mistake.
 - The plugin makes no network connections: no telemetry and no update check.
 - Every process the shell starts goes through a fixed output cap.
 
@@ -82,7 +109,7 @@ bar eleven times in two minutes until Omarchy stopped restarting it.
 - `rules.py`: the list parser and the earlyoom regex builder. It is shared by the bridge
   and the root helper, so the panel's "applied" check and the root side build the same
   string.
-- `helper/`: the optional root earlyoom link: a path unit, a oneshot sync service, an
+- `helper/`: the optional root earlyoom link: a timer, a oneshot sync service, an
   earlyoom drop-in, and install/uninstall scripts.
 
 ## Rules

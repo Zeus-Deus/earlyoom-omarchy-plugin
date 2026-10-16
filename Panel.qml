@@ -65,11 +65,11 @@ Panel {
         if (row.state === "foreign") { flash("Left alone: that service already has its own 50-oomguard.conf"); return; }
         if (row.kind === "window" && row.shared) { flash("This window shares a process with others · protect the app"); return; }
         if (row.protected) askUnprotect(row);
-        else protectRow(row.kind, row.key, row.name);
+        else protectRow(row.kind, row.key, row.name, row);
     }
-    function protectRow(kind, key, name) {
+    function protectRow(kind, key, name, row) {
         errorText = "";
-        service.protect(kind, key);
+        service.protect(kind, key, row ? row.pid : 0, row ? row.start : 0);
         flash(kind === "service" ? "Protected " + name + " · restart it to apply" : "Protecting " + name + "…");
     }
     function askUnprotect(row) {

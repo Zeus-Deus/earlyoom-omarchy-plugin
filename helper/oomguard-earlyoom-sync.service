@@ -1,7 +1,7 @@
+# Managed by OOM Guard (io.github.zeus-deus.oomguard).
 [Unit]
 Description=Apply OOM Guard protected names to earlyoom
-StartLimitIntervalSec=60
-StartLimitBurst=20
+Documentation=https://github.com/Zeus-Deus/earlyoom-omarchy-plugin
 
 [Service]
 Type=oneshot
@@ -9,6 +9,9 @@ ExecStart=/usr/lib/oomguard/oomguard-earlyoom-sync
 ProtectHome=read-only
 ProtectSystem=strict
 ReadWritePaths=/etc/oomguard
+RuntimeDirectory=oomguard
+RuntimeDirectoryPreserve=yes
 PrivateTmp=true
 PrivateNetwork=true
 NoNewPrivileges=true
+TimeoutStartSec=60
