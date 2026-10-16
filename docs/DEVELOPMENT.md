@@ -187,5 +187,24 @@ environment overrides. They never touch the real ones.
   Relink (Enter on the card) opened Omarchy's terminal, ran the helper, and earlyoom's
   `--ignore` then included `herdr`.
 
+Root helper, with real sudo (0.2.0):
+- A 0.1.1 link upgrades; its two unmarked generated files are shown and replaced
+  only after "y" (refused with no terminal, kept on "n").
+- Re-running `install.sh` does not restart earlyoom. Five link/unlink cycles in a
+  row leave earlyoom running.
+- A deeply nested list, a name with a trailing newline and a symlinked
+  `~/.config/oomguard` each count as an empty list for that user; the timer keeps
+  running.
+- Foreign files at every target path are refused by install and left by
+  uninstall; a foreign timer is not stopped. A clean uninstall leaves nothing.
+- An earlyoom drop-in with an indented `ExecStart=` override is refused.
+- An administrator `--ignore` makes OOM Guard step back, written plainly, with
+  spaces around `=`, split across a line continuation, or in a wildcard
+  `EnvironmentFile=` (`*.conf`, `[[:digit:]]*.conf`); `--ignore-root-user` does not.
+  Removing it and restarting earlyoom brings OOM Guard's list back.
+- After all of that, a protected `herdr` window survived a memory fill that got the
+  unprotected one killed.
+
 Not verified: the memory-pressure kill path of systemd-oomd (only the swap path was
-driven), multiple users with one earlyoom, and a current Omarchy dev build.
+driven), several real user accounts sharing one earlyoom (tested with fixtures), and
+a current Omarchy dev build.

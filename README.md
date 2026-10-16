@@ -60,6 +60,26 @@ terminal with one fixed command each (`sudo bash <plugin>/helper/install.sh`,
 No network connections, no telemetry. Full details in
 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
+### What a reviewer will flag
+
+An automated scan reports four capabilities. Each is user-started and fixed:
+
+- **privilege**: `helper/install.sh` and `helper/uninstall.sh`, run with `sudo` in
+  Omarchy's visible terminal from the **Link…** button. They install a root timer
+  that turns users' lists into earlyoom's `--ignore`, and refuse to touch any file
+  without OOM Guard's ownership line.
+- **service-management**: `sudo systemctl enable|disable --now earlyoom.service`
+  from **Turn on…/Turn off…**; the panel's own `systemctl --user` calls only
+  reload or restart the user service you picked.
+- **package-manager**: `omarchy pkg add|drop earlyoom` from **Install…/Remove…**,
+  the official Arch package.
+- **installer**: the same `helper/install.sh`.
+
+The commands come from one fixed table, `Model.earlyoomCommand`, and are passed as
+one argument to `omarchy-launch-floating-terminal-with-presentation`
+(`Service.qml`, `runEarlyoom`). Nothing in them comes from a window, a setting or
+the list. Turning earlyoom off and removing it ask first.
+
 ## Remove
 
 ```bash
