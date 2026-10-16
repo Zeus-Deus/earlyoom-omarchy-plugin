@@ -806,10 +806,15 @@ def earlyoom_state(rules, units):
     pid = unit.get("MainPID", "0")
     if pid.isdigit() and int(pid) > 0:
         args = read_sys(os.path.join(proc_root(), pid, "cmdline"), 8192).split("\0")
-    running = ""
+    values = []
     for i, a in enumerate(args[:-1]):
         if a == "--ignore":
-            running = args[i + 1]  # earlyoom keeps the last --ignore it parses
+            values.append(args[i + 1])
+        elif a.startswith("--ignore="):
+            values.append(a[len("--ignore="):])
+    running = values[-1] if values else ""  # earlyoom keeps the last --ignore it parses
+    # An --ignore OOM Guard did not produce (ours always holds the session names).
+    foreign = any(not (v.startswith("^(") and set(R.SESSION_COMMS) <= R.names_in_regex(v)) for v in values)
     active = unit.get("ActiveState") == "active"
     timer = units.get(SYNC_TIMER_UNIT, {})
     old = units.get(OLD_PATH_UNIT, {})
@@ -831,6 +836,7 @@ def earlyoom_state(rules, units):
         admin = R.admin_ignore(read_small(admin_defaults(), 65536))
     except OSError:
         admin = False
+    admin = admin or foreign
     return {"installed": installed, "active": active,
             "failed": unit.get("ActiveState") == "failed",
             "enabled": unit.get("UnitFileState") in ("enabled", "enabled-runtime", "static", "indirect", "alias"),

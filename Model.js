@@ -322,7 +322,7 @@ function killerNotice(status) {
     if (eo.active && eo.linked && eo.syncWatching === false)
         return {text: "The earlyoom link is not running, so list changes do not reach earlyoom.", level: "warn", action: "link", label: "Relink…"};
     if (eo.active && eo.adminIgnore)
-        return {text: "earlyoom uses its own --ignore from /etc/default/earlyoom, so it does not use this list.", level: "warn", action: ""};
+        return {text: "earlyoom runs with its own --ignore (set in its config), so it does not use this list. Restart earlyoom after removing it.", level: "warn", action: ""};
     if (eo.active && eo.linked && (eo.omitted || []).length > 0)
         return {text: "earlyoom takes 32 names per user; it skips " + sanitize((eo.omitted || []).join(", "), 60) + ".", level: "warn", action: ""};
     if (eo.active && eo.linked && !eo.applied)

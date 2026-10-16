@@ -797,7 +797,7 @@ def test_a_failed_earlyoom_restart_fails_the_sync(tmp_path, monkeypatch):
     monkeypatch.setattr(h, "STAMP", str(tmp_path / "stamp"))
     monkeypatch.setattr(h, "ADMIN_ENV", str(tmp_path / "none"))
     monkeypatch.setattr(h, "human_users", lambda: [])
-    monkeypatch.setattr(h, "running_ignore", lambda: (True, "old"))
+    monkeypatch.setattr(h, "running_ignore", lambda: (True, "old", []))
     monkeypatch.setattr(h, "admin_has_ignore", lambda: False)
 
     class P:
@@ -849,11 +849,11 @@ def test_yielding_restarts_an_earlyoom_still_running_our_list(tmp_path, monkeypa
     class P:
         returncode = 0
     monkeypatch.setattr(h.subprocess, "run", lambda argv, **k: restarts.append(argv) or P())
-    monkeypatch.setattr(h, "running_ignore", lambda: (True, R.regex_for_names(["herdr"])))
+    monkeypatch.setattr(h, "running_ignore", lambda: (True, R.regex_for_names(["herdr"]), [R.regex_for_names(["herdr"])]))
     assert h.main() == 0 and restarts and restarts[-1][:2] == ["systemctl", "try-restart"]
     restarts.clear()
     (tmp_path / "stamp").unlink()
-    monkeypatch.setattr(h, "running_ignore", lambda: (True, "^(sshd)$"))
+    monkeypatch.setattr(h, "running_ignore", lambda: (True, "^(sshd)$", ["^(sshd)$"]))
     assert h.main() == 0 and not restarts
 
 
@@ -872,3 +872,51 @@ def test_root_helper_expands_wildcard_environment_files(tmp_path, monkeypatch):
     assert h.admin_has_ignore()
     (d / "b.conf").unlink()
     assert not h.admin_has_ignore()
+
+
+def test_unusual_globs_and_big_files_count_as_an_admin_ignore(tmp_path, monkeypatch):
+    h = load_helper()
+    monkeypatch.setattr(h, "ADMIN_ENV", str(tmp_path / "none"))
+    big = tmp_path / "big.env"
+    big.write_text("X=1\n" * 20000)
+
+    class P:
+        returncode = 0
+        stdout = "Environment=\nEnvironmentFiles=%s/[[:digit:]]*.conf (ignore_errors=yes)\n" % tmp_path
+    monkeypatch.setattr(h.subprocess, "run", lambda *a, **k: P())
+    assert h.admin_has_ignore()
+    P.stdout = "Environment=\nEnvironmentFiles=%s (ignore_errors=yes)\n" % big
+    assert h.admin_has_ignore()
+
+
+def test_a_foreign_ignore_in_the_running_earlyoom_makes_the_sync_step_back(tmp_path, monkeypatch):
+    h = load_helper()
+    env = tmp_path / "earlyoom.env"
+    monkeypatch.setattr(h, "ENV_FILE", str(env))
+    monkeypatch.setattr(h, "STAMP", str(tmp_path / "stamp"))
+    monkeypatch.setattr(h, "human_users", lambda: [])
+    monkeypatch.setattr(h, "admin_has_ignore", lambda: False)
+    ours = R.regex_for_names([])
+    monkeypatch.setattr(h, "running_ignore", lambda: (True, ours, ["^(sshd)$", ours]))
+
+    class P:
+        returncode = 0
+    calls = []
+    monkeypatch.setattr(h.subprocess, "run", lambda argv, **k: calls.append(argv) or P())
+    assert h.main() == 0
+    assert env.read_text().endswith("OOMGUARD_ARGS=\n") and calls[-1][:2] == ["systemctl", "try-restart"]
+
+
+def test_a_foreign_running_ignore_is_reported_as_the_admins(env, monkeypatch):
+    b = load_bridge()
+    (env / "earlyoom-dropin.conf").write_text("x")
+    monkeypatch.setenv("OOMGUARD_EARLYOOM_DEFAULTS", str(env / "none"))
+    d = env / "proc" / "77"
+    d.mkdir(parents=True)
+    (d / "cmdline").write_bytes(b"/usr/bin/earlyoom\0--ignore\0^(sshd)$\0")
+    units = {"earlyoom.service": {"LoadState": "loaded", "ActiveState": "active", "MainPID": "77"},
+             b.SYNC_TIMER_UNIT: {"LoadState": "loaded", "ActiveState": "active"}}
+    st = b.earlyoom_state([{"kind": "app", "key": "a", "comms": ["chromium"]}], units)
+    assert st["adminIgnore"] and not st["applied"]
+    (d / "cmdline").write_bytes(b"/usr/bin/earlyoom\0--ignore\0" + R.regex_for_names(["chromium"]).encode() + b"\0")
+    assert not b.earlyoom_state([{"kind": "app", "key": "a", "comms": ["chromium"]}], units)["adminIgnore"]

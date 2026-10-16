@@ -96,8 +96,12 @@ def admin_has_ignore():
             path = line[len("EnvironmentFiles="):].split(" (", 1)[0].strip()
             if not path or path == ENV_FILE:
                 continue
-            if any(ch in path for ch in "*?["):
-                # systemd expands wildcards in EnvironmentFile=; so do we.
+            if any(ch in path for ch in "*?[]{}\\"):
+                # systemd expands wildcards with its own glob rules. Only a
+                # plain "*" or "?" is expanded here; anything else (classes,
+                # braces, escapes) counts as yes rather than being guessed.
+                if any(ch in path for ch in "[]{}\\"):
+                    return True
                 matches = glob.glob(path)
                 if len(matches) > 256:
                     return True
@@ -107,31 +111,42 @@ def admin_has_ignore():
     for path in sorted(files):
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
-                texts.append(f.read(MAX_BYTES))
+                text = f.read(MAX_BYTES + 1)
         except FileNotFoundError:
             continue
         except OSError:
             return True
+        if len(text) > MAX_BYTES:
+            return True  # too big to read whole: assume it has one
+        texts.append(text)
     return any(R.admin_ignore(t) for t in texts)
 
 
+def ours_value(value):
+    """An --ignore value OOM Guard produced: always contains the session names."""
+    return value.startswith("^(") and set(R.SESSION_COMMS) <= R.names_in_regex(value)
+
+
 def running_ignore():
-    """(running, value of the last --ignore earlyoom was started with)."""
+    """(running, value of the last --ignore earlyoom was started with,
+    every --ignore value it was started with)."""
     p = subprocess.run(["systemctl", "show", "-p", "MainPID", "--value", "earlyoom.service"],
                        capture_output=True, text=True, timeout=10, check=False)
     pid = p.stdout.strip()
     if not pid.isdigit() or pid == "0":
-        return False, ""
+        return False, "", []
     try:
         with open("/proc/%s/cmdline" % pid, "rb") as f:
             args = f.read(65536).decode("utf-8", "replace").split("\0")
     except OSError:
-        return False, ""
-    value = ""
+        return False, "", []
+    values = []
     for i, a in enumerate(args[:-1]):
         if a == "--ignore":
-            value = args[i + 1]  # earlyoom keeps the last one it parses
-    return True, value
+            values.append(args[i + 1])
+        elif a.startswith("--ignore="):
+            values.append(a[len("--ignore="):])
+    return True, (values[-1] if values else ""), values  # earlyoom keeps the last one
 
 
 def write_env(text):
@@ -180,7 +195,10 @@ def main():
             names.update(R.earlyoom_names(read_list(pw)))  # at most MAX_IGNORE_NAMES per user
         except Exception as exc:  # one user's list never stops the others
             print("skipped uid %d: %s" % (pw.pw_uid, type(exc).__name__), file=sys.stderr)
-    yielded = admin_has_ignore()
+    running, have, every = running_ignore()
+    # Ground truth beside the file check: an --ignore in the running command
+    # line that OOM Guard did not produce is the administrator's.
+    yielded = admin_has_ignore() or any(not ours_value(v) for v in every)
     regex = "" if yielded else R.regex_for_names(names)
     # Every name passed R.ok_comm, so this never fires; it stays as a last
     # guard on what reaches a root unit's command line.
@@ -190,11 +208,9 @@ def main():
     if not write_env(R.MARKER + "\nOOMGUARD_ARGS=%s\n" % ("--ignore " + regex if regex else "")):
         print("%s was not written by OOM Guard; leaving it alone" % ENV_FILE, file=sys.stderr)
         return 1
-    running, have = running_ignore()
     # Yielding: nothing to do unless earlyoom still runs with OOM Guard's
-    # list (recognisable by the session names it always contains), which as
-    # the last --ignore would override the administrator's.
-    stale_ours = have.startswith("^(") and set(R.SESSION_COMMS) <= R.names_in_regex(have)
+    # list, which as the last --ignore would override the administrator's.
+    stale_ours = ours_value(have)
     if not running or have == regex or (yielded and not stale_ours):
         return 0
     if not restart_allowed():
