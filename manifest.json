@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.zeus-deus.oomguard",
   "name": "OOM Guard",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "Zeus-Deus",
   "license": "MIT",
   "description": "Protect the apps and services you care about from being killed when memory runs out. Works with Omarchy's systemd-oomd and with earlyoom.",

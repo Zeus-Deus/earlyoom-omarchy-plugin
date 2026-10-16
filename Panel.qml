@@ -37,6 +37,9 @@ Panel {
     readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
     readonly property color muted: bar && bar.muted ? bar.muted : Commons.Color.muted
     readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+    // One wheel notch = three two-line rows, the same pace as the other
+    // Omarchy plugin lists (PassPage, Drives).
+    readonly property real wheelStep: (Style.spacing.rowPaddingX + Style.space(38)) * 3
     readonly property int pollMs: Math.max(2, Math.min(30, setting("refreshIntervalSec", 3))) * 1000
 
     implicitWidth: button.implicitWidth
@@ -46,10 +49,12 @@ Panel {
         if (!name || name === tab) return;
         tab = name;
         cursor = 0;
+        pointerGate.reset();
         if (name === "killers") service.loadKills();
         panelFlick.contentY = 0;
     }
     function moveCursor(dy) {
+        pointerGate.reset();
         if (!cursorActive) { cursorActive = true; cursor = Math.max(0, Math.min(cursor, rows.length - 1)); return; }
         cursor = Model.clampIndex(cursor + dy, rows.length);
     }
@@ -145,6 +150,7 @@ Panel {
     onOpenedChanged: {
         if (opened) {
             cursorActive = false;
+            pointerGate.reset();
             errorText = "";
             service.refresh();
             if (tab === "killers") service.loadKills();
@@ -180,6 +186,7 @@ Panel {
         running: root.opened
         onTriggered: service.refresh()
     }
+    PointerMoveGate { id: pointerGate; referenceItem: keyCatcher }
     Timer { id: noticeTimer; interval: 3000; onTriggered: root.notice = "" }
 
     IpcHandler {
@@ -202,6 +209,7 @@ Panel {
                 rows: root.rows.map(function(r) { return {kind: r.kind, name: r.name, key: r.key, protected: !!r.protected, state: r.state || "", sub: r.sub || "",
                                                           card: r.card || null}; }),
                 notice: root.notice, error: root.errorText, killer: root.killer.text,
+                scrollY: panelFlick.contentY, scrollMax: Math.max(0, panelFlick.contentHeight - panelFlick.height),
                 earlyoom: s ? s.earlyoom : null, oomd: s ? s.oomd : null, confirm: confirmation.opened
             });
         }
@@ -331,13 +339,16 @@ Panel {
                         flickableDirection: Flickable.VerticalFlick
                         interactive: contentHeight > height
                         Controls.ScrollBar.vertical: Controls.ScrollBar { policy: Controls.ScrollBar.AsNeeded }
+                        // Flickable's own wheel handling starts a tiny kinetic flick per
+                        // notch, which crawls. Step contentY directly; touchpads keep
+                        // their own pixel deltas.
                         WheelHandler {
                             acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
                             onWheel: function(event) {
                                 if (!panelFlick.interactive) return;
                                 panelFlick.cancelFlick();
                                 panelFlick.contentY = Model.wheelContentY(panelFlick.contentY, panelFlick.contentHeight, panelFlick.height,
-                                                                          event.pixelDelta.y, event.angleDelta.y, Style.spacing.popupRowHeight * 3);
+                                                                          event.pixelDelta.y, event.angleDelta.y, root.wheelStep);
                                 event.accepted = true;
                             }
                         }
@@ -381,7 +392,12 @@ Panel {
                                             anchors.fill: parent
                                             hoverEnabled: true
                                             acceptedButtons: Qt.LeftButton | Qt.MiddleButton
-                                            onEntered: { root.cursorActive = true; root.cursor = slot.index }
+                                            // Only real pointer movement moves the cursor. A row sliding
+                                            // under a resting pointer while the wheel scrolls must not
+                                            // grab it, or ensureVisible pulls the list back.
+                                            onPositionChanged: function(mouse) {
+                                                if (pointerGate.moved(rowItem, mouse)) { root.cursorActive = true; root.cursor = slot.index }
+                                            }
                                             onClicked: function(mouse) {
                                                 if (mouse.button === Qt.MiddleButton) root.showWindow(rowItem.entry);
                                                 else if (rowItem.entry.kind === "app" && rowItem.entry.expandable) root.toggleExpanded(rowItem.entry);
@@ -578,7 +594,9 @@ Panel {
             anchors.fill: parent
             hoverEnabled: true
             acceptedButtons: Qt.NoButton
-            onEntered: { root.cursorActive = true; root.cursor = kc.rowIndex }
+            onPositionChanged: function(mouse) {
+                if (pointerGate.moved(kc, mouse)) { root.cursorActive = true; root.cursor = kc.rowIndex }
+            }
         }
         Column {
             id: kcCol
