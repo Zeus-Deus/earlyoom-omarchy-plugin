@@ -2,8 +2,8 @@
 // file in Node (vm context). QML only lays out what these functions return.
 
 var RESPONSE_CAP = 1024 * 1024;
-var TABS = ["apps", "services", "kills"];
-var TAB_LABELS = {apps: "Apps", services: "Services", kills: "Kills"};
+var TABS = ["apps", "services", "killers"];
+var TAB_LABELS = {apps: "Apps", services: "Services", killers: "Killers"};
 
 // Fixed-literal output cap for the bridge (see docs/DEVELOPMENT.md): the
 // shell's StdioCollector would otherwise buffer whatever the child prints.
@@ -60,33 +60,62 @@ function ruleFor(rules, kind, key) {
     return null;
 }
 
-// Apps tab: protected apps first (running or not), then other open windows.
-function appRows(status) {
+// Apps tab: one row per app, then one row per window when the app has
+// several, or when its only window runs something worth naming (herdr in a
+// terminal). Protected apps first, then by memory. Window rows carry what
+// makes them recognisable: workspace, the program inside, title, memory.
+function windowRule(rules, address) { return ruleFor(rules, "window", address); }
+
+function appRows(status, expanded) {
     var s = status || {};
     var apps = s.apps || [];
     var rules = s.rules || [];
+    var open = expanded || {};
     var rows = [];
     var seen = {};
+    var ordered = [];
     for (var i = 0; i < rules.length; i++) {
         var r = rules[i];
         if (r.kind !== "app") continue;
         var live = null;
         for (var j = 0; j < apps.length; j++) if (apps[j].key === r.key) { live = apps[j]; break; }
         seen[r.key] = true;
-        var exposed = live ? (live.exposed || []).length : 0;
-        rows.push({
-            kind: "app", key: r.key, name: sanitize(live ? live.name : r.name, 48), protected: true, running: !!live,
-            memBytes: live ? live.memBytes : 0,
-            sub: !live ? "Not open · protected when it opens"
-                : (exposed > 0 ? "Protecting…" : "Protected · " + windowsLabel(live.windows)),
-            state: !live ? "idle" : (exposed > 0 ? "pending" : "guarded")
-        });
+        ordered.push({app: live, rule: r});
     }
-    for (var k = 0; k < apps.length; k++) {
-        var a = apps[k];
-        if (seen[a.key]) continue;
-        rows.push({kind: "app", key: a.key, name: sanitize(a.name, 48), protected: false, running: true,
-                   memBytes: a.memBytes, sub: windowsLabel(a.windows), state: "open"});
+    for (var k = 0; k < apps.length; k++) if (!seen[apps[k].key]) ordered.push({app: apps[k], rule: null});
+    // Window rules whose app row is not shown protected still need a row.
+    for (var n = 0; n < ordered.length; n++) {
+        var a = ordered[n].app;
+        var rule = ordered[n].rule;
+        var wins = a ? (a.windowList || []) : [];
+        var winProtected = 0;
+        for (var w = 0; w < wins.length; w++) if (windowRule(rules, wins[w].address)) winProtected++;
+        var exposed = a ? (a.exposed || []).length : 0;
+        var sub, state;
+        if (rule && !a) { sub = "Not open · protected when it opens"; state = "idle"; }
+        else if (rule) { sub = exposed > 0 ? "Protecting…" : "Protected · " + windowsLabel(a.windows); state = exposed > 0 ? "pending" : "guarded"; }
+        else if (winProtected > 0) { sub = winProtected + " of " + windowsLabel(a.windows) + " protected"; state = "partial"; }
+        else { sub = windowsLabel(a.windows); state = "open"; }
+        var key = rule ? rule.key : a.key;
+        var showWindows = !rule && wins.length > 0 && (wins.length > 1 || !!wins[0].running);
+        var isOpen = showWindows && (open[key] === true || winProtected > 0 || (open[key] !== false && wins.length <= 3));
+        rows.push({kind: "app", key: key, name: sanitize(a ? a.name : rule.name, 48), protected: !!rule, running: !!a,
+                   memBytes: a ? a.memBytes : 0, sub: sub, state: state,
+                   expandable: showWindows, expanded: isOpen});
+        if (!isOpen) continue;
+        for (var v = 0; v < wins.length; v++) {
+            var win = wins[v];
+            var wr = windowRule(rules, win.address);
+            var label = win.running ? sanitize(win.running, 24) : sanitize(win.title || "window", 40);
+            var parts = [sanitize(win.workspace, 20)];
+            if (win.running && win.title) parts.push(sanitize(win.title, 40));
+            var guarded = !!wr && win.guarded;
+            rows.push({kind: "window", key: win.address, app: key, name: label, protected: !!wr, running: true,
+                       memBytes: win.memBytes, shared: !!win.shared,
+                       sub: win.shared ? parts[0] + " · shares a process · protect the app"
+                          : (wr ? (guarded ? "Protected · " : "Protecting… · ") : "") + parts.join(" · "),
+                       state: win.shared ? "shared" : (wr ? (guarded ? "guarded" : "pending") : "open")});
+        }
     }
     return rows;
 }
@@ -132,22 +161,128 @@ function serviceRows(status) {
     return rows;
 }
 
+// Kill history, newest first. Back-to-back kills of the same thing by the
+// same killer (earlyoom retrying a respawning process) fold into one row.
 function killRows(kills, now, rules) {
     var out = [];
     var list = kills || [];
     for (var i = 0; i < list.length; i++) {
         var k = list[i];
         var by = k.by === "earlyoom" ? "earlyoom" : "systemd-oomd";
+        var name = sanitize(k.name, 40);
+        var prev = out.length ? out[out.length - 1] : null;
+        if (prev && prev.by === by && prev.name === name && Math.abs(prev.t - Number(k.t)) <= 600) {
+            prev.count++;
+            prev.sub = prev.when + " · " + prev.who + " · " + prev.count + " times";
+            continue;
+        }
         var detail = by === "earlyoom"
             ? (k.rssBytes ? formatBytes(k.rssBytes) + " · " : "") + sanitize(k.signal || "", 10)
             : (k.processes ? k.processes + " processes" : "whole app");
-        var key = typeof k.key === "string" ? k.key : "";
-        out.push({kind: "kill", key: key, name: sanitize(k.name, 40), by: by,
-                  sub: ago(k.t, now) + " · " + by + " · " + detail,
-                  protectable: key !== "" && !ruleFor(rules, "app", key),
-                  protected: key !== "" && !!ruleFor(rules, "app", key)});
+        var who = by === "earlyoom" ? "earlyoom" : "Omarchy";
+        out.push({kind: "kill", key: "", name: name, by: by, t: Number(k.t) || 0, count: 1,
+                  when: ago(k.t, now), who: who,
+                  sub: ago(k.t, now) + " · " + who + " · " + detail,
+                  protectable: false, protected: false});
     }
     return out;
+}
+
+function percent(n) {
+    var v = Number(n);
+    return isFinite(v) ? (Math.round(v * 10) / 10) + "%" : "?";
+}
+
+function sinceDate(t) {
+    if (!t) return "";
+    var d = new Date(Number(t) * 1000);
+    var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    return d.getDate() + " " + months[d.getMonth()];
+}
+
+// The two killer cards on the Killers tab. Each card: who it is, whether it
+// runs, when it acts, what it kills, its kills in the window, and which
+// action the panel offers for it.
+function killsLine(n, days, last, now) {
+    var c = Number(n) || 0;
+    return (c === 1 ? "1 kill" : c + " kills") + " in " + days + " days" + (last ? " · last " + ago(last, now) : "");
+}
+
+function killerCards(status, killsResult, now) {
+    var s = status || {};
+    var o = s.oomd || {};
+    var e = s.earlyoom || {};
+    var counts = (killsResult && killsResult.counts) || {};
+    var last = (killsResult && killsResult.last) || {};
+    var days = (killsResult && killsResult.days) || 30;
+    var cards = [];
+    var swap = o.swapLimit === null || o.swapLimit === undefined ? 90 : o.swapLimit;
+    cards.push({
+        id: "oomd", title: "systemd-oomd", badge: o.byOmarchy ? "Omarchy" : "systemd",
+        state: o.active ? "Running" : (o.enabled ? "Stopped" : "Off"), active: !!o.active,
+        when: "Swap over " + percent(swap) + ", or memory stalled for 20 s",
+        what: "Closes a whole app · never Hyprland or the bar",
+        kills: killsLine(counts["systemd-oomd"], days, last["systemd-oomd"], now),
+        note: o.byOmarchy ? "Turned on by Omarchy" : "",
+        action: "", actionLabel: "", secondary: "", secondaryLabel: ""
+    });
+    var lim = e.limits || {memPercent: 10, swapPercent: 10};
+    var stale = !!(e.linked && e.helperCurrent === false);
+    var needsLink = !!(e.installed && e.active && (!e.linked || stale));
+    var state, action = "", actionLabel = "", secondary = "", secondaryLabel = "";
+    if (!e.installed) { state = "Not installed"; action = "install"; actionLabel = "Install…"; }
+    else if (e.active) {
+        state = "Running";
+        if (needsLink) { action = "link"; actionLabel = stale ? "Relink…" : "Link…"; secondary = "stop"; secondaryLabel = "Turn off…"; }
+        else { action = "stop"; actionLabel = "Turn off…"; }
+    } else {
+        state = e.failed ? "Failed" : "Off";
+        action = "start"; actionLabel = "Turn on…"; secondary = "remove"; secondaryLabel = "Remove…";
+    }
+    var note = [];
+    if (e.package) note.push("Your package " + sanitize(e.package.version, 20) + " · since " + sinceDate(e.package.installedAt));
+    if (e.installed && e.active && !e.linked) note.push("not linked to your list");
+    else if (stale) note.push("link out of date");
+    else if (e.linked && e.active) note.push(e.applied ? "follows your list" : "updating…");
+    cards.push({
+        id: "earlyoom", title: "earlyoom", badge: "yours", state: state, active: !!e.active,
+        when: !e.installed ? "Not installed · Omarchy does not ship it"
+              : (lim.absolute ? "Fixed memory and swap sizes"
+              : "Free memory under " + percent(lim.memPercent) + " and free swap under " + percent(lim.swapPercent)),
+        what: "Kills the biggest process · works on servers too",
+        kills: e.installed ? killsLine(counts.earlyoom, days, last.earlyoom, now) : "",
+        note: note.join(" · "), action: action, actionLabel: actionLabel,
+        secondary: secondary, secondaryLabel: secondaryLabel, linked: !!e.linked
+    });
+    return cards;
+}
+
+function killersRows(status, killsResult, now) {
+    var rows = [];
+    var cards = killerCards(status, killsResult, now);
+    for (var i = 0; i < cards.length; i++) rows.push({kind: "killer", key: cards[i].id, card: cards[i], name: cards[i].title});
+    var kills = killRows(killsResult ? killsResult.kills : [], now, status ? status.rules : []);
+    for (var j = 0; j < kills.length; j++) rows.push(kills[j]);
+    return rows;
+}
+
+// The only commands the Killers tab can run. Each goes to Omarchy's visible
+// floating terminal, where the user reads it and types their own password.
+// Nothing in them comes from the bridge, a setting or a window.
+function earlyoomCommand(action, pluginDir, linked) {
+    var unlink = "sudo bash " + shellQuote(String(pluginDir).replace(/\/+$/, "") + "/helper/uninstall.sh") + " && ";
+    if (action === "start") return "sudo systemctl enable --now earlyoom.service";
+    if (action === "stop") return "sudo systemctl disable --now earlyoom.service";
+    if (action === "install") return "omarchy pkg add earlyoom && sudo systemctl enable --now earlyoom.service";
+    if (action === "remove") return (linked ? unlink : "") + "omarchy pkg drop earlyoom";
+    if (action === "link") return linkCommand(pluginDir);
+    return "";
+}
+
+function earlyoomConfirm(action) {
+    if (action === "stop") return {text: "Turn off earlyoom?\nOmarchy's systemd-oomd keeps running.", confirm: "Turn off"};
+    if (action === "remove") return {text: "Remove the earlyoom package?\nOmarchy's systemd-oomd keeps running.", confirm: "Remove"};
+    return null;
 }
 
 function protectedCount(status) {
@@ -174,12 +309,14 @@ function killerNotice(status) {
         return {text: "systemd-oomd is set to watch oomguard.slice too, so protection does not hold.", level: "warn", action: ""};
     if (eo.active && !eo.linked && (eo.names || []).length > 0)
         return {text: "earlyoom is running and does not know this list yet.", level: "warn", action: "link"};
+    if (eo.active && eo.linked && eo.helperCurrent === false)
+        return {text: "earlyoom's link is from an older OOM Guard. Relink to include windows.", level: "warn", action: "link", label: "Relink…"};
     if (eo.active && eo.linked && !eo.applied)
         return {text: "Updating earlyoom…", level: "ok", action: ""};
     var parts = [];
-    if (oomd.active) parts.push("systemd-oomd");
-    if (eo.active) parts.push("earlyoom");
-    if (parts.length === 0) return {text: "No OOM daemon is running. Only the kernel can kill apps.", level: "ok", action: ""};
+    if (oomd.active) parts.push(oomd.byOmarchy ? "Omarchy's systemd-oomd" : "systemd-oomd");
+    if (eo.active) parts.push("your earlyoom");
+    if (parts.length === 0) return {text: "No OOM killer is running. Only the kernel can kill apps.", level: "ok", action: ""};
     var who = parts.join(" and ");
     if (protectedCount(status) === 0)
         return {text: who + " can close any app when memory runs out. Switch on the ones to keep.", level: "ok", action: ""};
@@ -202,13 +339,18 @@ function tooltip(status) {
 function hints(tab, row) {
     var parts = ["j/k move"];
     if (row) {
-        if (tab === "kills") { if (row.protectable) parts.push("Enter protect"); }
-        else parts.push(row.protected ? "Enter unprotect" : "Enter protect");
+        if (row.kind === "window") { parts.push(row.shared ? "" : (row.protected ? "Enter unprotect" : "Enter protect")); parts.push("f show"); }
+        else if (row.kind === "app" || row.kind === "service") parts.push(row.protected ? "Enter unprotect" : "Enter protect");
+        else if (row.kind === "killer" && row.card) {
+            if (row.card.actionLabel) parts.push("Enter " + row.card.actionLabel.replace("…", "").toLowerCase());
+            if (row.card.secondaryLabel) parts.push("o " + row.card.secondaryLabel.replace("…", "").toLowerCase());
+        }
+        if (row.kind === "app" && row.expandable) parts.push("w windows");
         if (tab === "services" && row.running) parts.push("r restart");
     }
     parts.push("Tab");
     parts.push("Esc");
-    return parts.join("   ");
+    return parts.filter(function(p) { return p !== ""; }).join("   ");
 }
 
 function nextTab(tab, delta) {
@@ -220,7 +362,7 @@ function nextTab(tab, delta) {
 function tabForKey(t) {
     if (t === "1") return "apps";
     if (t === "2") return "services";
-    if (t === "3") return "kills";
+    if (t === "3") return "killers";
     return "";
 }
 

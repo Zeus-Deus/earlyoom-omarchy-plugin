@@ -18,6 +18,8 @@ MAX_IGNORE_NAMES = 32
 COMM_RE = re.compile(r"^[A-Za-z0-9._+-]{1,15}$")
 UNIT_RE = re.compile(r"^[A-Za-z0-9:_.\\@-]{1,200}\.service$")
 CLASS_RE = re.compile(r"^[^\x00-\x1f\x7f/]{1,128}$")
+# A Hyprland window address. A window rule lives only as long as the window.
+WINDOW_RE = re.compile(r"^0x[0-9a-f]{1,16}$")
 # Interpreters, shells and launchers: ignoring one of these would protect
 # every script on the machine, not the app the user picked.
 # The desktop session itself. earlyoom's stock --avoid covers only init,
@@ -62,13 +64,24 @@ def normalize_rule(item):
     elif kind == "service":
         if not UNIT_RE.match(key):
             return None
+    elif kind == "window":
+        if not WINDOW_RE.match(key):
+            return None
     else:
         return None
     comms = item.get("comms")
     if comms is None and item.get("comm"):
         comms = [item.get("comm")]
-    return {"kind": kind, "key": key, "name": clean_text(item.get("name") or key, 60),
+    rule = {"kind": kind, "key": key, "name": clean_text(item.get("name") or key, 60),
             "comms": clean_comms(comms if isinstance(comms, list) else [])}
+    if kind == "window":
+        # Window addresses are reused after a window closes; the pid pins the
+        # rule to the one window it was made for.
+        pid = item.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+            return None
+        rule["pid"] = pid
+    return rule
 
 
 def parse_rules(raw):

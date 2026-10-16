@@ -70,9 +70,9 @@ test('killerNotice warns when earlyoom runs without the link, and offers Link', 
   base.earlyoom = {active: true, linked: true, applied: true, names: ['chromium']};
   assert.match(Model.killerNotice(base).text, /can close any app/);
   base.rules = [{kind: 'app', key: 'chromium'}];
-  assert.equal(Model.killerNotice(base).text, 'Switched-on apps are skipped by systemd-oomd and earlyoom.');
+  assert.equal(Model.killerNotice(base).text, 'Switched-on apps are skipped by systemd-oomd and your earlyoom.');
   same(Model.killerNotice({oomd: {active: true, guardWatched: true}, earlyoom: {}}).level, 'warn');
-  assert.match(Model.killerNotice({oomd: {}, earlyoom: {}}).text, /No OOM daemon/);
+  assert.match(Model.killerNotice({oomd: {}, earlyoom: {}}).text, /No OOM killer is running/);
 });
 
 test('linkCommand quotes the plugin path for the terminal hand-off', () => {
@@ -81,15 +81,101 @@ test('linkCommand quotes the plugin path for the terminal hand-off', () => {
   assert.equal(Model.shellQuote("a'b"), "'a'\\''b'");
 });
 
-test('killRows labels each killer and only offers protect for unprotected apps', () => {
+test('killRows names who killed what; kills are history, not toggles', () => {
   const rows = Model.killRows([
-    {by: 'systemd-oomd', name: 'A terminal', processes: 771, t: 1000},
+    {by: 'systemd-oomd', name: 'Terminal · herdr', processes: 771, t: 1000},
     {by: 'earlyoom', name: 'chromium', signal: 'SIGTERM', rssBytes: 2 * 1024 ** 3, t: 1000, key: 'chromium'},
   ], 1000 + 3 * 3600, [{kind: 'app', key: 'chromium'}]);
-  assert.equal(rows[0].sub, '3 h ago · systemd-oomd · 771 processes');
-  assert.equal(rows[0].protectable, false);
+  assert.equal(rows[0].sub, '3 h ago · Omarchy · 771 processes');
   assert.equal(rows[1].sub, '3 h ago · earlyoom · 2.0 G · SIGTERM');
+  assert.equal(rows[0].protectable, false);
+});
+
+const terminals = {
+  rules: [],
+  apps: [{key: 'foot', name: 'Foot', memBytes: 6e9, windows: 2, exposed: ['a', 'b'], windowList: [
+    {address: '0xaa', pid: 50, title: 'agents', workspace: 'workspace 4', running: 'herdr', memBytes: 5e9, shared: false, guarded: false},
+    {address: '0xbb', pid: 60, title: 'notes', workspace: 'workspace 2', running: '', memBytes: 1e9, shared: false, guarded: false}]},
+    {key: 'brave', name: 'Brave', memBytes: 1e9, windows: 1, exposed: ['c'], windowList: [
+    {address: '0xcc', pid: 70, title: 'Inbox', workspace: 'workspace 3', running: '', memBytes: 1e9, shared: false, guarded: false}]}],
+};
+
+test('repeated kills of one thing fold into one row', () => {
+  const now = 100000;
+  const k = (t, name, by) => ({by: by || 'earlyoom', name, signal: 'SIGTERM', rssBytes: 5e8, t});
+  const rows = Model.killRows([k(90000, 'quickshell'), k(89990, 'quickshell'), k(89980, 'quickshell'),
+                               k(89970, 'chromium'), k(80000, 'quickshell')], now, []);
+  same(rows.map(r => [r.name, r.count]), [['quickshell', 3], ['chromium', 1], ['quickshell', 1]]);
+  assert.equal(rows[0].sub, '2 h ago · earlyoom · 3 times');
+});
+
+test('appRows lists each window under its app with workspace, program and title', () => {
+  const rows = Model.appRows(terminals);
+  same(rows.map(r => [r.kind, r.name]), [['app', 'Foot'], ['window', 'herdr'], ['window', 'notes'], ['app', 'Brave']]);
+  assert.equal(rows[1].sub, 'workspace 4 · agents');
+  assert.equal(rows[2].sub, 'workspace 2');
+  assert.equal(rows[0].expandable, true);
+  assert.equal(rows[3].expandable, false);  // one plain window: nothing to pick
+  const folded = Model.appRows(terminals, {foot: false});
+  same(folded.map(r => r.name), ['Foot', 'Brave']);
+});
+
+test('a protected window shows on its row and on its app', () => {
+  const s = JSON.parse(JSON.stringify(terminals));
+  s.rules = [{kind: 'window', key: '0xaa', name: 'Foot · herdr', comms: ['herdr'], pid: 50}];
+  s.apps[0].windowList[0].guarded = true;
+  const rows = Model.appRows(s, {foot: false});
+  assert.equal(rows[0].sub, '1 of 2 windows protected');
+  assert.equal(rows[0].state, 'partial');
   assert.equal(rows[1].protected, true);
+  assert.equal(rows[1].sub, 'Protected · workspace 4 · agents');
+  assert.equal(rows[2].protected, false);
+});
+
+test('a window that shares its process cannot be protected on its own', () => {
+  const s = JSON.parse(JSON.stringify(terminals));
+  s.apps[0].windowList[1].shared = true;
+  const row = Model.appRows(s)[2];
+  assert.equal(row.state, 'shared');
+  assert.match(row.sub, /protect the app/);
+});
+
+test('killer cards show Omarchy oomd and your earlyoom side by side', () => {
+  const now = 1792130000;
+  const status = {
+    oomd: {active: true, enabled: true, byOmarchy: true, swapLimit: 90, pressureLimit: 50},
+    earlyoom: {installed: true, active: true, enabled: true, linked: false, applied: false,
+               package: {version: '1.9.0-1', installedAt: 1784995596, explicit: true},
+               limits: {memPercent: 10, swapPercent: 10, absolute: false}},
+  };
+  const kills = {days: 30, counts: {'systemd-oomd': 12, earlyoom: 6}, last: {'systemd-oomd': now - 3600, earlyoom: now - 60}, kills: []};
+  const [o, e] = Model.killerCards(status, kills, now);
+  assert.equal(o.badge, 'Omarchy');
+  assert.equal(o.when, 'Swap over 90%, or memory stalled for 20 s');
+  assert.equal(o.kills, '12 kills in 30 days · last 1 h ago');
+  assert.equal(o.action, '');  // Omarchy owns it; the panel does not offer to stop it
+  assert.equal(e.badge, 'yours');
+  same([e.action, e.actionLabel, e.secondary], ['link', 'Link…', 'stop']);  // Enter does the safe thing
+  assert.match(e.note, /^Your package 1\.9\.0-1 · since \d+ Jul · not linked to your list$/);
+  status.earlyoom.linked = true; status.earlyoom.helperCurrent = false;
+  same([Model.killerCards(status, kills, now)[1].actionLabel, Model.killerCards(status, kills, now)[1].note.split(' · ').pop()], ['Relink…', 'link out of date']);
+  status.earlyoom.helperCurrent = true; status.earlyoom.applied = true;
+  same([Model.killerCards(status, kills, now)[1].action, Model.killerCards(status, kills, now)[1].secondary], ['stop', '']);
+  assert.equal(Model.killerCards(status, {days: 30, counts: {'systemd-oomd': 1}, last: {}}, now)[0].kills, '1 kill in 30 days');
+  status.earlyoom.active = false;
+  const off = Model.killerCards(status, kills, now)[1];
+  same([off.action, off.secondary], ['start', 'remove']);
+  const none = Model.killerCards({oomd: {}, earlyoom: {installed: false}}, null, now)[1];
+  same([none.action, none.state, none.kills], ['install', 'Not installed', '']);
+});
+
+test('earlyoom commands come from one fixed table and unlink before removal', () => {
+  assert.equal(Model.earlyoomCommand('stop', '/p'), 'sudo systemctl disable --now earlyoom.service');
+  assert.equal(Model.earlyoomCommand('remove', '/p', false), 'omarchy pkg drop earlyoom');
+  assert.equal(Model.earlyoomCommand('remove', "/p'x/", true), "sudo bash '/p'\\''x/helper/uninstall.sh' && omarchy pkg drop earlyoom");
+  assert.equal(Model.earlyoomCommand('rm -rf /', '/p'), '');
+  assert.equal(Model.earlyoomConfirm('start'), null);
+  assert.match(Model.earlyoomConfirm('stop').text, /systemd-oomd keeps running/);
 });
 
 test('wheelContentY clamps and steps', () => {
@@ -103,6 +189,11 @@ test('every hint key in the footer is bound in Panel.qml', () => {
   const panel = fs.readFileSync(path.join(root, 'Panel.qml'), 'utf8');
   assert.match(panel, /t === "r" \|\| t === "R"/);
   assert.match(panel, /Model\.tabForKey\(t\)/);
+  assert.match(panel, /t === "f" \|\| t === "F"/);
+  // Space is PanelKeyCatcher's activate key; folding must not share it.
+  assert.match(panel, /t === "w" \|\| t === "W"/);
+  assert.doesNotMatch(panel, /t === " "/);
+  assert.match(panel, /t === "o" \|\| t === "O"/);
   // h and l are cursor verbs in PanelKeyCatcher and never reach onTextKey.
   assert.doesNotMatch(panel, /t === "[hljkx]"/);
 });
@@ -139,7 +230,8 @@ test('the only root path is a fixed command in a visible terminal', () => {
   const src = fs.readFileSync(path.join(root, 'Service.qml'), 'utf8') + fs.readFileSync(path.join(root, 'Panel.qml'), 'utf8');
   assert.doesNotMatch(src, /pkexec|"sudo"/);
   const detached = src.match(/execDetached\([^\n]+/g) || [];
-  same(detached, ['execDetached(["omarchy-launch-floating-terminal-with-presentation", Model.linkCommand(pluginDir)]);']);
+  same(detached, ['execDetached(["omarchy-launch-floating-terminal-with-presentation", cmd]);']);
+  assert.match(src, /var cmd = Model\.earlyoomCommand\(action, pluginDir, linked\);/);
 });
 
 test('no agent-instruction file ships at the repository root', () => {

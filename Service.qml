@@ -15,6 +15,7 @@ Item {
 
     property var status: null
     property var kills: []
+    property var killsResult: null
     property bool killsLoaded: false
     property bool busy: false
     property var request: ({})
@@ -59,7 +60,7 @@ Item {
         busy = false;
         var result = Model.parseResponse(output.text, code, timedOut);
         if (result.ok && req.op === "status") status = result;
-        if (result.ok && req.op === "kills") { kills = result.kills || []; killsLoaded = true; }
+        if (result.ok && req.op === "kills") { kills = result.kills || []; killsResult = result; killsLoaded = true; }
         completed(req.op, result, req);
         Qt.callLater(drainQueue);
     }
@@ -70,12 +71,17 @@ Item {
     function unprotect(kind, key) { run({op: "unprotect", kind: kind, key: key}) }
     function restartService(key) { run({op: "restart_service", key: key}) }
     function applyNow() { run({op: "apply"}) }
+    function focusWindow(address) { run({op: "focus", address: address}) }
 
     // Hands one fixed command to Omarchy's floating terminal, where the user
-    // reads it and types their own password. Nothing here runs as root and
-    // no element of the command comes from the bridge or from a setting.
-    function linkEarlyoom() {
-        Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", Model.linkCommand(pluginDir)]);
+    // reads it and types their own password. Nothing here runs as root; the
+    // command comes from Model.earlyoomCommand's fixed table, never from the
+    // bridge, a setting or a window.
+    function runEarlyoom(action, linked) {
+        var cmd = Model.earlyoomCommand(action, pluginDir, linked);
+        if (cmd === "") return false;
+        Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", cmd]);
+        return true;
     }
 
     Process {

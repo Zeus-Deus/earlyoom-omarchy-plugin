@@ -7,9 +7,10 @@ import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
-// Bar button + one KeyboardPanel. Three tabs: Apps (open windows), Services
-// (user services) and Kills (what systemd-oomd and earlyoom killed lately).
-// Every row has one action: protect / unprotect. Processes live in Service.qml.
+// Bar button + one KeyboardPanel. Three tabs: Apps (apps and their single
+// windows), Services (user services) and Killers (Omarchy's systemd-oomd and
+// the user's earlyoom side by side, with what each killed). Processes live in
+// Service.qml.
 Panel {
     id: root
     moduleName: "io.github.zeus-deus.oomguard"
@@ -23,11 +24,13 @@ Panel {
     property string errorText: ""
     property string confirmKind: ""
     property string confirmKey: ""
+    property string confirmAction: ""
+    property var expanded: ({})
 
     readonly property var status: service.status
-    readonly property var rows: tab === "apps" ? Model.appRows(status)
+    readonly property var rows: tab === "apps" ? Model.appRows(status, expanded)
                                : (tab === "services" ? Model.serviceRows(status)
-                               : Model.killRows(service.kills, Date.now() / 1000, status ? status.rules : []))
+                               : Model.killersRows(status, service.killsResult, Date.now() / 1000))
     readonly property var cursorRow: cursorActive && cursor >= 0 && cursor < rows.length ? rows[cursor] : null
     readonly property var killer: Model.killerNotice(status)
     readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
@@ -43,7 +46,7 @@ Panel {
         if (!name || name === tab) return;
         tab = name;
         cursor = 0;
-        if (name === "kills") service.loadKills();
+        if (name === "killers") service.loadKills();
         panelFlick.contentY = 0;
     }
     function moveCursor(dy) {
@@ -52,11 +55,10 @@ Panel {
     }
     function activate(row) {
         if (!row || service.mutating) return;
-        if (row.kind === "kill") {
-            if (row.protectable) protectRow("app", row.key, row.name);
-            return;
-        }
+        if (row.kind === "kill") return;
+        if (row.kind === "killer") { killerAction(row.card, row.card.action); return; }
         if (row.state === "foreign") { flash("Left alone: that service already has its own 50-oomguard.conf"); return; }
+        if (row.kind === "window" && row.shared) { flash("This window shares a process with others · protect the app"); return; }
         if (row.protected) askUnprotect(row);
         else protectRow(row.kind, row.key, row.name);
     }
@@ -66,6 +68,7 @@ Panel {
         flash(kind === "service" ? "Protected " + name + " · restart it to apply" : "Protecting " + name + "…");
     }
     function askUnprotect(row) {
+        confirmAction = "";
         confirmKind = row.kind;
         confirmKey = row.key;
         confirmation.message = "Stop protecting " + Model.sanitize(row.name, 40) + "?\nUnder memory pressure it can be killed again.";
@@ -73,11 +76,45 @@ Panel {
         confirmation.selectedIndex = 0;
         confirmation.opened = true;
     }
-    function confirmUnprotect() {
+    function confirmed() {
+        if (confirmAction !== "") { runKiller(confirmAction); confirmAction = ""; return; }
         service.unprotect(confirmKind, confirmKey);
         flash("Unprotected");
         confirmKind = "";
         confirmKey = "";
+    }
+    // earlyoom actions open Omarchy's terminal with a fixed command. Turning
+    // it off or removing it asks first, with Cancel selected.
+    function killerAction(card, action) {
+        if (!card || !action) return;
+        var ask = Model.earlyoomConfirm(action);
+        if (ask) {
+            confirmAction = action;
+            confirmation.message = ask.text;
+            confirmation.confirmText = ask.confirm;
+            confirmation.selectedIndex = 0;
+            confirmation.opened = true;
+            return;
+        }
+        runKiller(action);
+    }
+    function runKiller(action) {
+        if (!status || !status.terminalAvailable) { errorText = "Omarchy's terminal launcher is missing"; return; }
+        var linked = !!(status.earlyoom && status.earlyoom.linked);
+        root.close();
+        service.runEarlyoom(action, linked);
+    }
+    function showWindow(row) {
+        if (!row || row.kind !== "window") return;
+        root.close();
+        service.focusWindow(row.key);
+    }
+    function toggleExpanded(row) {
+        if (!row || row.kind !== "app" || !row.expandable) return;
+        var next = {};
+        for (var k in expanded) next[k] = expanded[k];
+        next[row.key] = !row.expanded;
+        expanded = next;
     }
     function restartCursorService() {
         var row = cursorRow;
@@ -90,11 +127,10 @@ Panel {
         var tabName = Model.tabForKey(t);
         if (tabName !== "") { selectTab(tabName); return; }
         if (t === "r" || t === "R") restartCursorService();
-        else if (t === "L" && root.killer.action === "link") linkEarlyoom();
-    }
-    function linkEarlyoom() {
-        root.close();
-        service.linkEarlyoom();
+        else if (t === "f" || t === "F") showWindow(cursorRow);
+        else if (t === "w" || t === "W") toggleExpanded(cursorRow);
+        else if ((t === "o" || t === "O") && cursorRow && cursorRow.kind === "killer") killerAction(cursorRow.card, cursorRow.card.secondary);
+        else if (t === "L" && root.killer.action === "link") runKiller("link");
     }
 
     function ensureVisible(item) {
@@ -111,7 +147,7 @@ Panel {
             cursorActive = false;
             errorText = "";
             service.refresh();
-            if (tab === "kills") service.loadKills();
+            if (tab === "killers") service.loadKills();
             Qt.callLater(function() { keyCatcher.forceActiveFocus() });
         } else {
             confirmation.opened = false;
@@ -128,11 +164,11 @@ Panel {
             }
             if (op === "protect" || op === "unprotect" || op === "restart_service") {
                 root.errorText = (result.errors && result.errors.length) ? Model.sanitize(result.errors[0].error, 160) : "";
-                if (op === "protect" && result.kind === "app" && !(result.errors && result.errors.length))
+                if (op === "protect" && result.kind !== "service" && !(result.errors && result.errors.length))
                     root.flash("Protected " + Model.sanitize(result.name, 40));
                 if (op === "restart_service") root.flash("Restarted " + Model.sanitize(result.key, 40));
                 service.refresh();
-                if (root.tab === "kills") service.loadKills();
+                if (root.tab === "killers") service.loadKills();
             } else if (op === "apply" && result.moved && result.moved.length) {
                 service.refresh();
             }
@@ -158,11 +194,13 @@ Panel {
         function activate(): string { root.activate(root.cursorRow); return "ok" }
         function protect(key: string): string { service.protect("app", key); return "ok" }
         function unprotect(key: string): string { service.unprotect("app", key); return "ok" }
+        function key(t: string): string { root.handleTextKey(t); return "ok" }
         function status(): string {
             var s = root.status;
             return JSON.stringify({
                 opened: root.opened, tab: root.tab, cursor: root.cursorActive ? root.cursor : -1,
-                rows: root.rows.map(function(r) { return {name: r.name, key: r.key, protected: r.protected, state: r.state || "", sub: r.sub}; }),
+                rows: root.rows.map(function(r) { return {kind: r.kind, name: r.name, key: r.key, protected: !!r.protected, state: r.state || "", sub: r.sub || "",
+                                                          card: r.card || null}; }),
                 notice: root.notice, error: root.errorText, killer: root.killer.text,
                 earlyoom: s ? s.earlyoom : null, oomd: s ? s.oomd : null, confirm: confirmation.opened
             });
@@ -260,13 +298,13 @@ Panel {
                             id: linkButton
                             anchors.verticalCenter: parent.verticalCenter
                             visible: root.killer.action === "link" && root.status && root.status.terminalAvailable
-                            text: "Link…"
+                            text: root.killer.label || "Link…"
                             bordered: true
                             foreground: root.foreground
                             fontFamily: root.fontFamily
                             fontSize: Style.font.bodySmall
                             tooltipText: "L · opens a terminal that runs helper/install.sh with sudo"
-                            onClicked: root.linkEarlyoom()
+                            onClicked: root.runKiller("link")
                         }
                     }
 
@@ -311,86 +349,136 @@ Panel {
 
                             Repeater {
                                 model: root.rows.length
-                                delegate: CursorSurface {
-                                    id: rowItem
+                                delegate: Item {
+                                    id: slot
                                     required property int index
                                     readonly property var entry: root.rows[index] || ({})
+                                    readonly property bool isCard: entry.kind === "killer"
                                     width: list.width
-                                    implicitHeight: Style.space(44)
-                                    hasCursor: root.cursorActive && root.cursor === index
-                                    current: entry.protected === true && entry.kind !== "kill"
-                                    foreground: root.foreground
-                                    onHasCursorChanged: if (hasCursor) root.ensureVisible(rowItem)
+                                    implicitHeight: isCard ? card.implicitHeight : rowItem.implicitHeight
 
-                                    MouseArea {
-                                        anchors.fill: parent
-                                        hoverEnabled: true
-                                        onEntered: { root.cursorActive = true; root.cursor = rowItem.index }
-                                        onClicked: root.activate(rowItem.entry)
+                                    KillerCard {
+                                        id: card
+                                        visible: slot.isCard
+                                        width: parent.width
+                                        rowIndex: slot.index
+                                        data_: slot.isCard ? slot.entry.card : ({})
                                     }
-                                    Text {
-                                        id: glyph
-                                        anchors.left: parent.left
-                                        anchors.leftMargin: Style.space(10)
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        width: Style.space(22)
-                                        textFormat: Text.PlainText
-                                        text: rowItem.entry.kind === "kill" ? (rowItem.entry.protected ? "󰕥" : "󰚌")
-                                              : (rowItem.entry.protected ? (rowItem.entry.state === "pending" ? "󰞀" : "󰕥") : "󰒙")
-                                        color: rowItem.entry.kind === "kill" ? (rowItem.entry.protected ? Commons.Color.accent : root.urgent)
-                                               : (rowItem.entry.protected ? Commons.Color.accent : root.muted)
-                                        font.family: root.fontFamily
-                                        font.pixelSize: Style.font.icon
-                                    }
-                                    Column {
-                                        anchors.left: glyph.right
-                                        anchors.right: trailing.left
-                                        anchors.rightMargin: Style.space(8)
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        spacing: Style.space(2)
-                                        Text {
-                                            width: parent.width
-                                            textFormat: Text.PlainText
-                                            elide: Text.ElideRight
-                                            text: rowItem.entry.name || ""
-                                            color: rowItem.entry.running === false ? root.muted : root.foreground
-                                            font.family: root.fontFamily
-                                            font.pixelSize: Style.font.body
-                                            font.bold: rowItem.entry.protected === true && rowItem.entry.kind !== "kill"
+
+                                    CursorSurface {
+                                        id: rowItem
+                                        visible: !slot.isCard
+                                        width: parent.width
+                                        readonly property var entry: slot.entry
+                                        readonly property bool child: entry.kind === "window"
+                                        implicitHeight: Style.space(entry.kind === "kill" ? 40 : 44)
+                                        hasCursor: root.cursorActive && root.cursor === slot.index
+                                        current: entry.protected === true
+                                        foreground: root.foreground
+                                        onHasCursorChanged: if (hasCursor) root.ensureVisible(slot)
+
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            acceptedButtons: Qt.LeftButton | Qt.MiddleButton
+                                            onEntered: { root.cursorActive = true; root.cursor = slot.index }
+                                            onClicked: function(mouse) {
+                                                if (mouse.button === Qt.MiddleButton) root.showWindow(rowItem.entry);
+                                                else if (rowItem.entry.kind === "app" && rowItem.entry.expandable) root.toggleExpanded(rowItem.entry);
+                                                else root.activate(rowItem.entry);
+                                            }
                                         }
                                         Text {
-                                            width: parent.width
-                                            textFormat: Text.PlainText
-                                            elide: Text.ElideRight
-                                            text: rowItem.entry.sub || ""
-                                            color: rowItem.entry.state === "pending" || rowItem.entry.state === "foreign" ? root.urgent : root.muted
-                                            font.family: root.fontFamily
-                                            font.pixelSize: Style.font.caption
-                                        }
-                                    }
-                                    Row {
-                                        id: trailing
-                                        anchors.right: parent.right
-                                        anchors.rightMargin: Style.space(10)
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        spacing: Style.space(10)
-                                        Text {
+                                            id: glyph
+                                            anchors.left: parent.left
+                                            anchors.leftMargin: Style.space(rowItem.child ? 30 : 10)
                                             anchors.verticalCenter: parent.verticalCenter
-                                            visible: rowItem.entry.kind !== "kill" && (rowItem.entry.memBytes || 0) > 0
+                                            width: Style.space(22)
                                             textFormat: Text.PlainText
-                                            text: Model.formatBytes(rowItem.entry.memBytes)
-                                            color: root.muted
+                                            text: rowItem.entry.kind === "kill" ? "󰚌"
+                                                  : rowItem.entry.kind === "window" ? (rowItem.entry.protected ? "󰕥" : "󰆍")
+                                                  : (rowItem.entry.protected ? (rowItem.entry.state === "pending" ? "󰞀" : "󰕥")
+                                                     : (rowItem.entry.state === "partial" ? "󰞀" : "󰒙"))
+                                            color: rowItem.entry.kind === "kill" ? (rowItem.entry.by === "earlyoom" ? root.urgent : root.muted)
+                                                   : (rowItem.entry.protected || rowItem.entry.state === "partial" ? Commons.Color.accent : root.muted)
                                             font.family: root.fontFamily
-                                            font.pixelSize: Style.font.caption
+                                            font.pixelSize: Style.font.icon
                                         }
-                                        ToggleSwitch {
+                                        Column {
+                                            anchors.left: glyph.right
+                                            anchors.right: trailing.left
+                                            anchors.rightMargin: Style.space(8)
                                             anchors.verticalCenter: parent.verticalCenter
-                                            visible: rowItem.entry.kind !== "kill" || rowItem.entry.protectable || rowItem.entry.protected
-                                            checked: rowItem.entry.protected === true
-                                            busy: service.mutating
-                                            cursorRing: false
-                                            foreground: root.foreground
-                                            onToggled: root.activate(rowItem.entry)
+                                            spacing: Style.space(2)
+                                            Row {
+                                                width: parent.width
+                                                spacing: Style.space(6)
+                                                Text {
+                                                    width: Math.min(implicitWidth, parent.width - (chevron.visible ? chevron.width + parent.spacing : 0))
+                                                    textFormat: Text.PlainText
+                                                    elide: Text.ElideRight
+                                                    text: rowItem.entry.name || ""
+                                                    color: rowItem.entry.running === false ? root.muted : root.foreground
+                                                    font.family: root.fontFamily
+                                                    font.pixelSize: Style.font.body
+                                                    font.bold: rowItem.entry.protected === true
+                                                }
+                                                Text {
+                                                    id: chevron
+                                                    visible: rowItem.entry.expandable === true
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                    textFormat: Text.PlainText
+                                                    text: rowItem.entry.expanded ? "󰅀" : "󰅂"
+                                                    color: root.muted
+                                                    font.family: root.fontFamily
+                                                    font.pixelSize: Style.font.caption
+                                                }
+                                            }
+                                            Text {
+                                                width: parent.width
+                                                textFormat: Text.PlainText
+                                                elide: Text.ElideRight
+                                                text: rowItem.entry.sub || ""
+                                                color: rowItem.entry.state === "pending" || rowItem.entry.state === "foreign" ? root.urgent : root.muted
+                                                font.family: root.fontFamily
+                                                font.pixelSize: Style.font.caption
+                                            }
+                                        }
+                                        Row {
+                                            id: trailing
+                                            anchors.right: parent.right
+                                            anchors.rightMargin: Style.space(10)
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            spacing: Style.space(8)
+                                            PanelActionButton {
+                                                anchors.verticalCenter: parent.verticalCenter
+                                                visible: rowItem.entry.kind === "window"
+                                                opacity: rowItem.hasCursor ? 1 : 0.35
+                                                iconText: "󰈈"
+                                                foreground: root.foreground
+                                                tooltipText: "f · show this window"
+                                                onClicked: root.showWindow(rowItem.entry)
+                                            }
+                                            Text {
+                                                anchors.verticalCenter: parent.verticalCenter
+                                                visible: rowItem.entry.kind !== "kill" && (rowItem.entry.memBytes || 0) > 0
+                                                textFormat: Text.PlainText
+                                                text: Model.formatBytes(rowItem.entry.memBytes)
+                                                color: root.muted
+                                                font.family: root.fontFamily
+                                                font.pixelSize: Style.font.caption
+                                            }
+                                            ToggleSwitch {
+                                                anchors.verticalCenter: parent.verticalCenter
+                                                visible: rowItem.entry.kind !== "kill"
+                                                enabled: !(rowItem.entry.kind === "window" && rowItem.entry.shared)
+                                                opacity: enabled ? 1 : 0.35
+                                                checked: rowItem.entry.protected === true
+                                                busy: service.mutating
+                                                cursorRing: false
+                                                foreground: root.foreground
+                                                onToggled: root.activate(rowItem.entry)
+                                            }
                                         }
                                     }
                                 }
@@ -405,7 +493,7 @@ Panel {
                                 Text {
                                     anchors.horizontalCenter: parent.horizontalCenter
                                     textFormat: Text.PlainText
-                                    text: root.tab === "kills" ? "󰄬" : "󰒙"
+                                    text: "󰒙"
                                     color: root.muted
                                     font.family: root.fontFamily
                                     font.pixelSize: Style.space(30)
@@ -416,7 +504,6 @@ Panel {
                                     wrapMode: Text.WordWrap
                                     textFormat: Text.PlainText
                                     text: !root.status ? "Reading…"
-                                          : root.tab === "kills" ? (service.killsLoaded ? "Nothing was killed for lack of memory in the last 30 days." : "Reading the journal…")
                                           : root.tab === "apps" ? "No open windows." : "No user services in app.slice."
                                     color: root.muted
                                     font.family: root.fontFamily
@@ -469,8 +556,127 @@ Panel {
                     selectedIndex: 0
                     foreground: root.foreground
                     fontFamily: root.fontFamily
-                    onCanceled: { opened = false; root.confirmKind = ""; root.confirmKey = ""; keyCatcher.forceActiveFocus() }
-                    onConfirmed: { opened = false; root.confirmUnprotect(); keyCatcher.forceActiveFocus() }
+                    onCanceled: { opened = false; root.confirmKind = ""; root.confirmKey = ""; root.confirmAction = ""; keyCatcher.forceActiveFocus() }
+                    onConfirmed: { opened = false; root.confirmed(); keyCatcher.forceActiveFocus() }
+                }
+            }
+        }
+    }
+
+    // One OOM killer: name + who owns it, state, when it acts, what it kills,
+    // its recent kill count, and the one or two actions the panel offers.
+    component KillerCard: CursorSurface {
+        id: kc
+        property int rowIndex: 0
+        property var data_: ({})
+        bordered: true
+        hasCursor: root.cursorActive && root.cursor === rowIndex
+        foreground: root.foreground
+        implicitHeight: kcCol.implicitHeight + Style.space(20)
+        onHasCursorChanged: if (hasCursor) root.ensureVisible(kc)
+        MouseArea {
+            anchors.fill: parent
+            hoverEnabled: true
+            acceptedButtons: Qt.NoButton
+            onEntered: { root.cursorActive = true; root.cursor = kc.rowIndex }
+        }
+        Column {
+            id: kcCol
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: Style.space(12)
+            anchors.rightMargin: Style.space(12)
+            spacing: Style.space(3)
+            Item {
+                width: parent.width
+                implicitHeight: Math.max(kcTitle.implicitHeight, kcButtons.implicitHeight)
+                Row {
+                    id: kcTitle
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(8)
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        textFormat: Text.PlainText
+                        text: "●"
+                        color: kc.data_.active ? Commons.Color.accent : root.muted
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                    }
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        textFormat: Text.PlainText
+                        text: kc.data_.title || ""
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                        font.bold: true
+                    }
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        radius: Style.cornerRadius
+                        color: "transparent"
+                        border.width: 1
+                        border.color: root.muted
+                        implicitWidth: kcBadge.implicitWidth + Style.space(10)
+                        implicitHeight: kcBadge.implicitHeight + Style.space(2)
+                        Text {
+                            id: kcBadge
+                            anchors.centerIn: parent
+                            textFormat: Text.PlainText
+                            text: kc.data_.badge || ""
+                            color: root.muted
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption
+                        }
+                    }
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        textFormat: Text.PlainText
+                        text: kc.data_.state || ""
+                        color: kc.data_.active ? root.foreground : root.muted
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                    }
+                }
+                Row {
+                    id: kcButtons
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(6)
+                    Button {
+                        visible: (kc.data_.secondary || "") !== ""
+                        text: kc.data_.secondaryLabel || ""
+                        bordered: true
+                        foreground: root.foreground
+                        fontFamily: root.fontFamily
+                        fontSize: Style.font.caption
+                        onClicked: root.killerAction(kc.data_, kc.data_.secondary)
+                    }
+                    Button {
+                        visible: (kc.data_.action || "") !== ""
+                        text: kc.data_.actionLabel || ""
+                        bordered: true
+                        foreground: root.foreground
+                        fontFamily: root.fontFamily
+                        fontSize: Style.font.caption
+                        onClicked: root.killerAction(kc.data_, kc.data_.action)
+                    }
+                }
+            }
+            Repeater {
+                model: [kc.data_.when, kc.data_.what, kc.data_.kills, kc.data_.note]
+                delegate: Text {
+                    required property var modelData
+                    visible: !!modelData
+                    width: kcCol.width
+                    textFormat: Text.PlainText
+                    wrapMode: Text.WordWrap
+                    text: modelData || ""
+                    color: root.muted
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
                 }
             }
         }

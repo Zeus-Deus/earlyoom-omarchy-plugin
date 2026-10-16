@@ -4,14 +4,14 @@ Reference for contributors. Nothing here runs as part of the plugin.
 
 ## Files
 
-- `Panel.qml`: bar button, `KeyboardPanel` with three tabs, confirm dialog and IPC verbs.
+- `Panel.qml`: bar button, `KeyboardPanel` with three tabs (Apps with per-window rows, Services, Killers with one card per OOM killer), confirm dialog and IPC verbs (`open`, `close`, `tab`, `cursor`, `activate`, `key`, `status`).
   Uses eager children, not the newer lazy `content:`, so it loads on stable Omarchy 4.0.x.
 - `Service.qml`: the bridge `Process`, request queue and deadline. It also listens to
   Hyprland `openwindow` events and runs `apply` (debounced) so new windows of protected
   apps move out of `app.slice`. It is loaded whenever the bar widget is.
 - `Model.js`: pure helpers with no Qt imports, loaded by Node in a `vm` context.
 - `bridge.py`: one JSON request on stdin, one response on stdout, exit 0.
-  Ops: `status`, `kills`, `protect`, `unprotect`, `apply`, `restart_service`.
+  Ops: `status`, `kills`, `protect`, `unprotect`, `apply`, `restart_service`, `focus`. Rule kinds: `app`, `service`, `window` (address + pid; dropped when the window closes).
 - `rules.py`: the list parser and the earlyoom regex builder. It is shared by the bridge
   and the root helper, so the panel's "applied" check and the root side build the same
   string.

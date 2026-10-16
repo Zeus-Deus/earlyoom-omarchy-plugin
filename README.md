@@ -2,9 +2,9 @@
 
 Choose the apps and services that must not be killed when your memory runs out.
 
-| Apps | Services | Kills |
+| Apps and single windows | Both killers | Services |
 |---|---|---|
-| ![Apps](docs/images/apps.png) | ![Services](docs/images/services.png) | ![Kills](docs/images/kills.png) |
+| ![Apps](docs/images/apps.png) | ![Killers](docs/images/killers.png) | ![Services](docs/images/services.png) |
 
 ## Install
 
@@ -20,19 +20,26 @@ sudo bash ~/.config/omarchy/plugins/io.github.zeus-deus.oomguard/helper/install.
 ```
 
 Update: `omarchy plugin update io.github.zeus-deus.oomguard`, then `omarchy-restart-shell`.
-Re-run the helper's `install.sh` only when `helper/` or `rules.py` changed.
+If an update changes the earlyoom link, the panel says the link is out of date
+and offers **Relink…**.
 
 ## What it does
 
-Click the shield in the bar. Every open window and every user service has a
-switch. Turn it on and that app is skipped the next time memory runs out.
+Click the shield in the bar. Every app, window and user service has a switch.
+Turn it on and it is skipped the next time memory runs out.
 
 - **Apps**: the app's windows are protected straight away, and so are windows it
   opens later. An app you protected keeps its switch even while it is closed.
+- **Single windows**: under each app, one row per window shows its workspace,
+  its title and, for a terminal, the program running in it (`herdr`, `nvim`,
+  `btop`). Protect just that window, not every terminal. Press `f` or click
+  the eye to jump to the window. A window rule ends when the window closes.
 - **Services**: user services such as Syncthing or a voice daemon. Protection
   takes effect when the service restarts; press `r` on the row to do that now.
-- **Kills**: what systemd-oomd and earlyoom killed in the last 30 days, with a
-  switch to protect the app that was killed.
+- **Killers**: Omarchy's systemd-oomd and your own earlyoom side by side: who
+  owns each, whether it runs, when it acts, how often it killed in the last 30
+  days, and the kills themselves. earlyoom can be turned on or off, linked to
+  your list, installed or removed from here.
 
 The line under the title tells you which killers are running and whether your
 list reaches all of them.
@@ -50,6 +57,20 @@ a normal call to your own systemd user manager and needs no password. A
 protected service gets a small drop-in, `~/.config/systemd/user/<unit>.d/50-oomguard.conf`,
 with `Slice=oomguard.slice`.
 
+### Two killers, one list
+
+| | systemd-oomd | earlyoom |
+|---|---|---|
+| Comes from | Omarchy turns it on | You install it (`omarchy pkg add earlyoom`) |
+| Acts when | swap is over 90 % full, or memory stalls for 20 s | free memory and free swap both fall under 10 % |
+| Kills | one whole app | the single biggest process |
+| Covers | apps launched in your desktop session | every process, on desktops and headless servers |
+
+They do not conflict. On a desktop with a large swap file, systemd-oomd
+usually acts first; earlyoom is the backstop that also works on servers and
+over SSH, where Omarchy's setup does not apply. OOM Guard keeps one list and
+applies it to both.
+
 **earlyoom** picks single processes by name and score. The panel keeps your
 list in `~/.config/oomguard/protected.json`. The optional helper is a root
 systemd path unit that turns that list into earlyoom's `--ignore` option and
@@ -65,22 +86,32 @@ bar eleven times in two minutes until Omarchy stopped restarting it.
   decides. Protect the apps you work in, not everything.
 - earlyoom only matches process names. Protecting Obsidian adds `electron`,
   which also covers other Electron apps with that name, and protecting a
-  terminal app adds `foot`, which covers every foot window.
+  terminal app adds `foot`, which covers every foot window. A single window
+  adds the name of the program inside it (`herdr`), so for earlyoom it covers
+  every process with that name.
+- A window that shares its process with other windows (a `foot --server`
+  setup, or several windows of one browser) cannot be protected alone; protect
+  the app instead. The panel says so on the row.
 - Windows of a protected app that open while the shell is not running are
   protected a few seconds after the shell starts.
 
 ## Keyboard
 
 `j`/`k` move · `Enter` switch on/off · `1` `2` `3` or `Tab` change tab ·
-`r` restart the selected service · `L` link earlyoom · `Esc` close.
-Switching protection off asks first. Cancel is the default.
+`f` show the selected window · `w` fold an app's windows ·
+`r` restart the selected service · `L` link earlyoom ·
+`o` the earlyoom card's second action · `Esc` close.
+Switching protection off, turning earlyoom off and removing it ask first.
+Cancel is the default.
 
 ## Security
 
-- The panel never runs anything as root. The only root step is the helper's
-  `install.sh`, which you start yourself. **Link…** opens Omarchy's terminal
-  with the fixed command `sudo bash <plugin>/helper/install.sh`, and you type
-  your own password there.
+- The panel never runs anything as root. **Link…**, **Turn on/off…**,
+  **Install…** and **Remove…** open Omarchy's terminal with one fixed
+  command each (`sudo bash <plugin>/helper/install.sh`,
+  `sudo systemctl enable|disable --now earlyoom.service`,
+  `omarchy pkg add|drop earlyoom`), and you type your own password there.
+  None of those commands is built from window titles, settings or the list.
 - The root helper reads each user's list as a regular file, without following
   symlinks, and with a size limit. It accepts only names made of
   `A-Z a-z 0-9 . _ + -`, at most 15 characters each, and refuses interpreters

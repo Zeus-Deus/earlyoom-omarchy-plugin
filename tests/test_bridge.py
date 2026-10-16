@@ -123,7 +123,7 @@ def test_inventory_follows_a_browser_across_two_scopes(env, monkeypatch):
     add_proc(env, 10, 1, "chromium", own)
     add_proc(env, 20, 10, "chromium", launcher, rss_pages=5000)
     add_proc(env, 21, 10, "chrome_crashpad", launcher)
-    monkeypatch.setattr(b, "hypr_clients", lambda: [{"class": "chromium", "pid": 10}])
+    monkeypatch.setattr(b, "hypr_clients", lambda: [{"class": "chromium", "pid": 10, "address": "0xa1", "title": "about:blank", "workspace": {"id": 1, "name": "1"}}])
     monkeypatch.setattr(b, "desktop_names", lambda: {"chromium": "Chromium"})
     apps = b.app_inventory(MANAGER)
     assert len(apps) == 1
@@ -142,7 +142,7 @@ def test_session_slice_and_zombies_never_count_as_part_of_an_app(env, monkeypatc
     add_proc(env, 16, 15, "uwsm-app", hypr)
     (env / "proc" / "16" / "stat").write_text("16 (uwsm-app) Z 15 0 0\n")
     add_proc(env, 17, 15, "Hyprland", hypr)  # even a live child there is not the app's
-    monkeypatch.setattr(b, "hypr_clients", lambda: [{"class": "org.gnome.Nautilus", "pid": 15}])
+    monkeypatch.setattr(b, "hypr_clients", lambda: [{"class": "org.gnome.Nautilus", "pid": 15, "address": "0xb2", "workspace": {"id": 2, "name": "2"}}])
     monkeypatch.setattr(b, "desktop_names", lambda: {})
     a = b.app_inventory(MANAGER)[0]
     assert a["scopes"] == [own] and a["memBytes"] == 100 * 4096
@@ -153,7 +153,7 @@ def test_protect_app_moves_every_scope_and_saves_the_list(env, monkeypatch):
     b = load_bridge()
     own = add_cgroup(env, "app.slice/app-org.chromium.Chromium-10.scope", [10])
     add_proc(env, 10, 1, "chromium", own)
-    monkeypatch.setattr(b, "hypr_clients", lambda: [{"class": "chromium", "pid": 10}])
+    monkeypatch.setattr(b, "hypr_clients", lambda: [{"class": "chromium", "pid": 10, "address": "0xa1", "title": "about:blank", "workspace": {"id": 1, "name": "1"}}])
     monkeypatch.setattr(b, "desktop_names", lambda: {})
     calls = []
 
@@ -236,17 +236,22 @@ def test_oomd_guard_watched_is_detected(monkeypatch):
     text = ("Swap Used Limit: 90.00%\nDefault Memory Pressure Limit: 50.00%\n"
             "Swap Monitored CGroups:\n\tPath: " + MANAGER + "/app.slice\n")
     monkeypatch.setattr(b, "run", lambda argv, **k: (0, text, ""))
-    st = b.oomd_state(MANAGER, True)
+    st = b._oomd_state(MANAGER, True)
     assert st["watchesApps"] and not st["guardWatched"] and st["swapLimit"] == 90.0
     monkeypatch.setattr(b, "run", lambda argv, **k: (0, text + "\tPath: " + MANAGER + "\n", ""))
-    assert b.oomd_state(MANAGER, True)["guardWatched"]
+    assert b._oomd_state(MANAGER, True)["guardWatched"]
 
 
 def test_scope_labels_for_kill_lines():
     b = load_bridge()
-    assert b.scope_label("app-Hyprland-xdg\\x2dterminal\\x2dexec-7d74f234.scope", {}) == "A terminal"
+    b.desktop_names = lambda: {"chromium": "Chromium", "codemux": "CodeMux"}
+    assert b.scope_label("app-Hyprland-xdg\\x2dterminal\\x2dexec-7d74f234.scope", {}) == "Terminal"
     assert b.scope_label("app-org.chromium.Chromium-824779.scope", {}) == "Chromium"
     assert b.scope_label("x.scope", {"x.scope": {"name": "Brave"}}) == "Brave"
+    launched = {"app-Hyprland-gtk\\x2dlaunch-6c0fdda6.scope": "gtk-launch codemux.desktop",
+                "app-Hyprland-xdg\\x2dterminal\\x2dexec-1.scope": "xdg-terminal-exec -e herdr"}
+    assert b.scope_label("app-Hyprland-gtk\\x2dlaunch-6c0fdda6.scope", {}, launched) == "CodeMux"
+    assert b.scope_label("app-Hyprland-xdg\\x2dterminal\\x2dexec-1.scope", {}, launched) == "Terminal · herdr"
 
 
 def test_kills_only_reports_this_users_earlyoom_victims(env, monkeypatch):
@@ -260,12 +265,15 @@ def test_kills_only_reports_this_users_earlyoom_victims(env, monkeypatch):
                         "USER_UNIT": "app-Hyprland-gtk\\x2dlaunch-6c0fdda6.scope", "__REALTIME_TIMESTAMP": "1000000000"})]
 
     def fake_run(argv, **k):
+        if "uwsm_app-daemon" in argv:
+            return (0, "", "")
         return (0, "\n".join(oomd if "_COMM=systemd" in argv else lines), "")
 
     monkeypatch.setattr(b, "run", fake_run)
     res = b.op_kills({"days": 3})
     assert [k["name"] for k in res["kills"]] == ["chromium", "An app"]
     assert res["kills"][1]["processes"] == 12
+    assert res["counts"] == {"systemd-oomd": 1, "earlyoom": 1}
 
 
 def test_bridge_process_always_answers_with_json(env):
@@ -274,3 +282,135 @@ def test_bridge_process_always_answers_with_json(env):
                            capture_output=True, timeout=20, env=dict(os.environ))
         assert p.returncode == 0
         assert json.loads(p.stdout)["ok"] is False
+
+
+# ---------------------------------------------------------------- windows
+
+def terminal_fixture(env, monkeypatch, b, shared=False):
+    """Two foot windows in one scope each; window A runs herdr, B runs vim."""
+    sa = add_cgroup(env, "app.slice/app-graphical.slice/app-Hyprland-foot-aaaaaaaa.scope", [50, 51, 52, 53])
+    sb = add_cgroup(env, "app.slice/app-graphical.slice/app-Hyprland-foot-bbbbbbbb.scope", [60, 61, 62])
+    add_proc(env, 50, 1, "foot", sa)
+    add_proc(env, 51, 50, "bash", sa)
+    add_proc(env, 52, 51, "herdr", sa, rss_pages=9000)
+    add_proc(env, 53, 52, "herdr", sa, rss_pages=200)
+    add_proc(env, 60, 1, "foot", sb)
+    add_proc(env, 61, 60, "bash", sb)
+    add_proc(env, 62, 61, "vim", sb)
+    clients = [{"class": "foot", "pid": 50, "address": "0xaa", "title": "agents", "workspace": {"id": 4, "name": "4"}},
+               {"class": "foot", "pid": 60, "address": "0xbb", "title": "notes", "workspace": {"id": 2, "name": "2"}}]
+    if shared:
+        clients[1]["pid"] = 50
+    monkeypatch.setattr(b, "hypr_clients", lambda: clients)
+    monkeypatch.setattr(b, "desktop_names", lambda: {"foot": "Foot"})
+    return sa, sb
+
+
+def test_each_terminal_window_shows_what_runs_in_it(env, monkeypatch):
+    b = load_bridge()
+    terminal_fixture(env, monkeypatch, b)
+    app = b.app_inventory(MANAGER)[0]
+    assert app["windows"] == 2
+    by = {w["address"]: w for w in app["windowList"]}
+    assert by["0xaa"]["running"] == "herdr" and by["0xaa"]["workspace"] == "workspace 4"
+    assert by["0xaa"]["title"] == "agents" and by["0xaa"]["comms"][0] == "herdr"
+    assert by["0xbb"]["running"] == "vim"
+    assert app["windowList"][0]["address"] == "0xaa"  # biggest first
+
+
+def test_protecting_one_window_moves_only_that_window(env, monkeypatch):
+    b = load_bridge()
+    terminal_fixture(env, monkeypatch, b)
+    moved = []
+    monkeypatch.setattr(b, "move_pids", lambda pids, dest, label, left: moved.append((sorted(pids), dest, label)) or
+                        {"ok": True, "moved": len(pids), "left": 0})
+    res = b.op_protect({"kind": "window", "key": "0xaa"})
+    assert res["ok"] and res["name"] == "Foot · herdr"
+    assert moved == [([50, 51, 52, 53], b.GUARD_SLICE, "Foot · herdr")]
+    saved = json.loads((env / "cfg" / "protected.json").read_text())["protected"]
+    assert saved == [{"kind": "window", "key": "0xaa", "name": "Foot · herdr", "comms": ["herdr"], "pid": 50}]
+    assert R.earlyoom_names(R.parse_rules(json.dumps({"protected": saved}))) == ["herdr"]
+
+
+def test_a_window_that_shares_its_process_is_refused(env, monkeypatch):
+    b = load_bridge()
+    terminal_fixture(env, monkeypatch, b, shared=True)
+    monkeypatch.setattr(b, "move_pids", lambda *a: pytest.fail("must not move a shared process"))
+    res = b.op_protect({"kind": "window", "key": "0xaa"})
+    assert not res["ok"] and "protect the app instead" in res["error"]
+
+
+def test_window_rules_die_with_their_window(env, monkeypatch):
+    b = load_bridge()
+    terminal_fixture(env, monkeypatch, b)
+    rules = [{"kind": "window", "key": "0xaa", "name": "Foot · herdr", "comms": ["herdr"], "pid": 50},
+             {"kind": "window", "key": "0xcc", "name": "gone", "comms": [], "pid": 999},
+             {"kind": "window", "key": "0xbb", "name": "reused address", "comms": [], "pid": 12345}]
+    (env / "cfg" / "protected.json").write_text(R.dump_rules(rules))
+    monkeypatch.setattr(b, "move_pids", lambda pids, *a: {"ok": True, "moved": len(pids), "left": 0})
+    res = b.op_apply({})
+    assert [m["key"] for m in res["moved"]] == ["0xaa"]
+    left = json.loads((env / "cfg" / "protected.json").read_text())["protected"]
+    assert [r["key"] for r in left] == ["0xaa"]
+
+
+def test_window_rules_need_a_valid_address_and_pid():
+    assert R.parse_rules(json.dumps({"protected": [
+        {"kind": "window", "key": "0xaa", "pid": 50},
+        {"kind": "window", "key": "0xaa; rm", "pid": 50},
+        {"kind": "window", "key": "0xbb"},
+        {"kind": "window", "key": "0xcc", "pid": True}]})) == [
+        {"kind": "window", "key": "0xaa", "name": "0xaa", "comms": [], "pid": 50}]
+
+
+def test_focus_only_dispatches_a_fixed_command_for_an_open_window(env, monkeypatch):
+    b = load_bridge()
+    monkeypatch.setattr(b, "hypr_clients", lambda: [{"address": "0xaa"}])
+    calls = []
+    monkeypatch.setattr(b, "run", lambda argv, **k: calls.append(argv) or (0, "ok", ""))
+    assert not b.op_focus({"address": '0xaa" }) os.execute("x'})["ok"]
+    assert not b.op_focus({"address": "0xbb"})["ok"]
+    assert b.op_focus({"address": "0xaa"})["ok"]
+    assert calls == [["hyprctl", "dispatch", 'hl.dsp.focus({ window = "address:0xaa" })']]
+
+
+# ---------------------------------------------------------------- both killers
+
+def test_earlyoom_package_and_limits_are_read_without_root(env, monkeypatch):
+    b = load_bridge()
+    db = env / "pacman"
+    (db / "earlyoom-1.9.0-1").mkdir(parents=True)
+    (db / "earlyoom-1.9.0-1" / "desc").write_text("%NAME%\nearlyoom\n\n%VERSION%\n1.9.0-1\n\n%INSTALLDATE%\n1784995596\n\n")
+    (db / "earlyoom-extra-2-1").mkdir()
+    monkeypatch.setenv("OOMGUARD_PACMAN_DB", str(db))
+    info = b.package_info("earlyoom")
+    assert info == {"version": "1.9.0-1", "installedAt": 1784995596, "explicit": True}
+    assert b.earlyoom_limits(["earlyoom", "-m", "5,2", "-s", "15"]) == {"memPercent": 5.0, "swapPercent": 15.0, "absolute": False}
+    assert b.earlyoom_limits(["earlyoom"]) == {"memPercent": 10.0, "swapPercent": 10.0, "absolute": False}
+
+
+def test_oomd_reports_whether_omarchy_turned_it_on(env, monkeypatch):
+    b = load_bridge()
+    conf = env / "10-oomd.conf"
+    monkeypatch.setenv("OOMGUARD_OMARCHY_OOMD_CONF", str(conf))
+    monkeypatch.setattr(b, "run", lambda argv, **k: (0, "", ""))
+    units = {"systemd-oomd.service": {"ActiveState": "active", "UnitFileState": "enabled", "ActiveEnterTimestamp": "@1791973195"}}
+    st = b.oomd_state(MANAGER, units)
+    assert st["active"] and st["enabled"] and not st["byOmarchy"] and st["since"] == 1791973195
+    conf.write_text("[Slice]\n")
+    assert b.oomd_state(MANAGER, units)["byOmarchy"]
+
+
+def test_a_link_from_an_older_plugin_version_is_reported(env, monkeypatch):
+    b = load_bridge()
+    dropin = env / "50-oomguard.conf"
+    dropin.write_text("[Service]\n")
+    helper = env / "helper-rules.py"
+    monkeypatch.setenv("OOMGUARD_EARLYOOM_DROPIN", str(dropin))
+    monkeypatch.setenv("OOMGUARD_HELPER_RULES", str(helper))
+    units = {"earlyoom.service": {"LoadState": "loaded", "ActiveState": "active", "MainPID": "0"},
+             b.SYNC_PATH_UNIT: {"LoadState": "loaded", "ActiveState": "active"}}
+    helper.write_text("old")
+    assert b.earlyoom_state([], units)["helperCurrent"] is False
+    helper.write_text(open(os.path.join(b.HERE, "rules.py")).read())
+    assert b.earlyoom_state([], units)["helperCurrent"] is True
