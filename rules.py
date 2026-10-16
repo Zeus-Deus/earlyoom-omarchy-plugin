@@ -145,24 +145,17 @@ def earlyoom_omitted(rules):
 
 
 def admin_ignore(text):
-    """True when /etc/default/earlyoom may pass earlyoom its own --ignore.
+    """True when an earlyoom environment text may pass its own --ignore.
 
-    Deliberately fails closed rather than re-implementing systemd's
-    environment-file parser (spaces around "=", quoting, line continuations):
-    any "--ignore" option anywhere outside a whole-line comment counts. Only
-    the separate option --ignore-root-user is told apart. A false positive just
+    Fails closed instead of re-implementing systemd's environment-file parser:
+    line continuations, backslash escapes and quotes are removed first, then
+    any "--ignore" option anywhere counts, comments included. Only the
+    separate option --ignore-root-user is told apart. A false positive only
     means OOM Guard adds nothing and the panel says the administrator's list
     is in charge; a false negative would override it."""
-    continued = False
-    for line in str(text or "").splitlines():
-        stripped = line.strip()
-        comment = not continued and stripped[:1] in ("#", ";")
-        continued = line.rstrip().endswith("\\")
-        if comment:
-            continue
-        if re.search(r"--ignore(?![-A-Za-z0-9_])", line):
-            return True
-    return False
+    squashed = re.sub(r"\\\r?\n", "", str(text or ""))
+    squashed = squashed.replace("\\", "").replace('"', "").replace("'", "")
+    return re.search(r"--ignore(?![-A-Za-z0-9_])", squashed) is not None
 
 
 

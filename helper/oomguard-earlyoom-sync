@@ -79,13 +79,31 @@ def human_users():
 
 
 def admin_has_ignore():
-    """True when /etc/default/earlyoom already passes its own --ignore."""
-    try:
-        with open(ADMIN_ENV, encoding="utf-8", errors="replace") as f:
-            text = f.read(MAX_BYTES)
-    except OSError:
-        return False
-    return R.admin_ignore(text)
+    """True when earlyoom may already get its own --ignore: from
+    /etc/default/earlyoom, any other EnvironmentFile= or an Environment=
+    line of its unit. Unreadable sources count as yes."""
+    texts = []
+    p = subprocess.run(["systemctl", "show", "-p", "Environment", "-p", "EnvironmentFiles", "earlyoom.service"],
+                       capture_output=True, text=True, timeout=10, check=False)
+    if p.returncode != 0:
+        return True
+    files = {ADMIN_ENV}
+    for line in p.stdout.splitlines():
+        if line.startswith("Environment="):
+            texts.append(line[len("Environment="):])
+        elif line.startswith("EnvironmentFiles="):
+            path = line[len("EnvironmentFiles="):].split(" (", 1)[0].strip()
+            if path and path != ENV_FILE:
+                files.add(path)
+    for path in sorted(files):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                texts.append(f.read(MAX_BYTES))
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return True
+    return any(R.admin_ignore(t) for t in texts)
 
 
 def running_ignore():
@@ -164,7 +182,11 @@ def main():
         print("%s was not written by OOM Guard; leaving it alone" % ENV_FILE, file=sys.stderr)
         return 1
     running, have = running_ignore()
-    if not running or have == regex or (yielded and have):
+    # Yielding: nothing to do unless earlyoom still runs with OOM Guard's
+    # list (recognisable by the session names it always contains), which as
+    # the last --ignore would override the administrator's.
+    stale_ours = have.startswith("^(") and set(R.SESSION_COMMS) <= R.names_in_regex(have)
+    if not running or have == regex or (yielded and not stale_ours):
         return 0
     if not restart_allowed():
         return 0  # a later tick applies it
